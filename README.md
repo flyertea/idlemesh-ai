@@ -6,7 +6,7 @@
 
 ## 下载
 
-下载并解压与操作系统、处理器对应的 ZIP。`amd64` 适用于 Intel 和 AMD 的 64 位处理器，`arm64` 适用于 Apple 芯片及其他 64 位 ARM 处理器。压缩包名例如 `idlemesh-v0.4.0-darwin-arm64.zip`。可以用发布页的 `SHA256SUMS` 核对下载。 [GitHub Releases](https://github.com/flyertea/idlemesh-ai/releases)
+下载并解压与操作系统、处理器对应的 ZIP。`amd64` 适用于 Intel 和 AMD 的 64 位处理器，`arm64` 适用于 Apple 芯片及其他 64 位 ARM 处理器。压缩包名例如 `idlemesh-v0.5.0-darwin-arm64.zip`。可以用发布页的 `SHA256SUMS` 核对下载。 [GitHub Releases](https://github.com/flyertea/idlemesh-ai/releases)
 
 ## 五分钟跑通
 
@@ -113,9 +113,11 @@ job=$(./idlemesh submit --server https://mesh.example.net:8787 --model qwen2.5:0
 
 ## 部署三协调器集群
 
-v0.3 支持三个固定的 Raft 投票节点。把它们放在三台独立且时钟同步的主机上，可在其中一台掉线后由其余两台选主并继续工作。失去多数派时，集群暂停提交、领取和查询，等多数派恢复后再处理。节点间采用双向 TLS。客户端和 Worker 用重复的 `--server` 指定同一集群的各个 API 地址，选主时可自动切换。 [部署步骤与故障演练](docs/ha-setup.md)
+三个 Raft 投票节点放在独立且时钟同步的主机上，可在其中一台掉线后由其余两台选主并继续工作。失去多数派时，集群暂停提交、领取和查询，等多数派恢复后再处理。节点间采用双向 TLS。客户端和 Worker 用重复的 `--server` 指定同一集群的各个 API 地址，选主时可自动切换。 [部署步骤与故障演练](docs/ha-setup.md)
 
 从单机切换到集群时，先让旧队列处理完并保留原 `--db` 文件，随后将客户端和 Worker 指向新集群。新集群使用独立的任务队列和任务 ID，旧任务可以通过原来的单机协调器查询。
+
+v0.5 支持在短维护窗口内替换一台协调器，也可以导出任务备份，在新目录恢复到单协调器或新的三节点集群。备份保留快照时点的任务 ID、已完成结果、幂等提交记录和 Worker 凭据状态。 [节点替换与灾难恢复](docs/ha-operations.md)
 
 ## 为每台 Worker 单独发放凭据
 

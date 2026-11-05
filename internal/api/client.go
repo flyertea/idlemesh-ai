@@ -270,14 +270,7 @@ func (c *Client) try(ctx context.Context, origin, method, path, key string, data
 
 	status := res.StatusCode
 	if status < 200 || status >= 300 {
-		var failure struct {
-			Error string `json:"error"`
-		}
-		json.NewDecoder(io.LimitReader(res.Body, 4096)).Decode(&failure)
-		if failure.Error == "" {
-			failure.Error = http.StatusText(status)
-		}
-		return status, &responseError{Status: status, Message: failure.Error}
+		return status, readResponseError(res)
 	}
 	if status == http.StatusNoContent || response == nil {
 		return status, nil
@@ -296,4 +289,15 @@ func (c *Client) try(ctx context.Context, origin, method, path, key string, data
 		lease.RequestStarted = started
 	}
 	return status, nil
+}
+
+func readResponseError(res *http.Response) error {
+	var failure struct {
+		Error string `json:"error"`
+	}
+	json.NewDecoder(io.LimitReader(res.Body, 4096)).Decode(&failure)
+	if failure.Error == "" {
+		failure.Error = http.StatusText(res.StatusCode)
+	}
+	return &responseError{Status: res.StatusCode, Message: failure.Error}
 }

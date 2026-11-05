@@ -71,23 +71,7 @@ func (p *projection) build(snapshot io.Reader) (*store, string, error) {
 	if snapshot == nil {
 		s, err = openStore(path, 0, 0)
 	} else {
-		var db *bolt.DB
-		db, err = bolt.Open(path, 0600, nil)
-		if err == nil {
-			err = db.Update(func(tx *bolt.Tx) error {
-				for _, bucket := range stateBuckets {
-					if tx.Bucket(bucket) == nil {
-						return fmt.Errorf("coordinator snapshot is missing bucket %q", bucket)
-					}
-				}
-				return ensureCredentialBuckets(tx)
-			})
-			if err != nil {
-				db.Close()
-			} else {
-				s = &store{db: db}
-			}
-		}
+		s, err = openSnapshotStore(path)
 	}
 	if err != nil {
 		os.Remove(path)

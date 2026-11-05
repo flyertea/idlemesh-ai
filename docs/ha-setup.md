@@ -4,7 +4,7 @@
 
 ## 本机演练
 
-解压 v0.4，把 `idlemesh` 二进制放在新的演练目录。以下演练使用默认的共享 Worker 令牌模式，证书命令使用 Bash 和 OpenSSL 3。Windows 可以在另一台可信主机签发证书和令牌，再使用后文的 PowerShell 命令启动。演练所有端口都绑定到 `127.0.0.1`。在开始前确认这些端口可用。
+解压当前版本，把 `idlemesh` 二进制放在新的演练目录。以下演练使用默认的共享 Worker 令牌模式，证书命令使用 Bash 和 OpenSSL 3。Windows 可以在另一台可信主机签发证书和令牌，再使用后文的 PowerShell 命令启动。演练所有端口都绑定到 `127.0.0.1`。在开始前确认这些端口可用。
 
 | 节点 ID | API 地址 | Raft 地址 | 状态目录 |
 | --- | --- | --- | --- |
@@ -147,13 +147,13 @@ $job = .\idlemesh.exe submit @servers --request-id $requestKey --engine echo --p
 
 为 API 单独配置证书和私钥，通过 `--listen`、`--tls-cert`、`--tls-key` 提供 HTTPS。例如把三个 API 地址设为 `https://mesh-a.example.net:8787`、`https://mesh-b.example.net:8787`、`https://mesh-c.example.net:8787`。API 证书应由客户端和 Worker 的操作系统信任，证书中的名称应匹配各自的 API 地址。Raft CA 只用于节点间认证。三个进程用相同的 `--lease`、`--max-attempts` 和角色令牌，并启用系统时间同步。Worker 和客户端各用三个 `--server` 指向同一集群的 API 地址。
 
-每台主机都保留自己的 `--raft-dir`。将目录和备份按敏感数据保护。维护期间逐台重启并确认 `/readyz` 可以从集群中的某台获得 `200`。丢失多数派时，优先恢复原节点、原目录和互通网络。固定成员名单应保持不变。
+每台主机都保留自己的 `--raft-dir`。将目录和备份按敏感数据保护。使用原名单维护时逐台重启并确认 `/readyz` 可以从集群中的某台获得 `200`。需要永久换机或从备份重建时，使用对应的维护流程。 [节点替换与灾难恢复](ha-operations.md)
 
 从单协调器迁移时，先停止往旧队列提交任务，等待队列处理完并保留旧 `--db` 文件。新集群从独立的队列开始。需要查旧任务时，仍通过原数据库启动单机协调器并在原入口查询。
 
 ## 启用独立 Worker 凭据
 
-三个协调器都须运行 v0.4 并使用同一种凭据模式。托管模式与共享令牌模式的 Raft 节点彼此隔离。切换现有集群时，安排一次维护窗口，停止所有旧协调器后再启动新配置，避免运行中混用两种模式。
+三个协调器都须运行支持托管凭据的版本，并使用同一种凭据模式。托管模式与共享令牌模式的 Raft 节点彼此隔离。切换现有集群时，安排一次维护窗口，停止所有旧协调器后再启动新配置。
 
 1. 为三个协调器配置相同的 `IDLEMESH_CLIENT_TOKEN` 和 `IDLEMESH_ADMIN_TOKEN`。两种令牌须不同。移除各协调器环境中的 `IDLEMESH_WORKER_TOKEN`。Bash 使用 `unset IDLEMESH_WORKER_TOKEN`，PowerShell 使用 `Remove-Item Env:IDLEMESH_WORKER_TOKEN`。
 2. 在各协调器原启动命令加上 `--managed-workers`。沿用每个节点原有的 `--raft-dir`、ID、固定成员地址和证书。已有集群的启动命令省略 `--raft-bootstrap`。

@@ -188,6 +188,18 @@ func (c *cluster) Ready(ctx context.Context) error {
 	return c.node.Barrier(ctx)
 }
 
+func (c *cluster) Backup(ctx context.Context) (*Backup, error) {
+	if err := c.Ready(ctx); err != nil {
+		return nil, err
+	}
+	c.view.mu.RLock()
+	defer c.view.mu.RUnlock()
+	if c.view.store == nil {
+		return nil, ha.ErrUnavailable
+	}
+	return c.view.store.Backup(ctx)
+}
+
 func (c *cluster) apply(ctx context.Context, op operation) applied {
 	if !c.node.IsLeader() {
 		return applied{err: ha.ErrUnavailable}

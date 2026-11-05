@@ -11,6 +11,8 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -30,6 +32,8 @@ type Config struct {
 	WorkerToken       string
 	AdminToken        string
 	ManagedWorkers    bool
+	EnableBackup      bool
+	RestoreBackup     string
 	AllowInsecureHTTP bool
 	Logger            *log.Logger
 	Raft              *ha.Config
@@ -60,8 +64,21 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
+	if cfg.RestoreBackup != "" {
+		if cfg.Raft == nil || !cfg.Raft.Bootstrap || cfg.Raft.ReplaceID != "" {
+			return errors.New("--restore-backup requires a fresh --raft-bootstrap voter; for standalone recovery use idlemesh restore")
+		}
+		files, err := os.ReadDir(cfg.Raft.DataDir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if len(files) > 0 {
+			return errors.New("--restore-backup requires a new or empty Raft data directory")
+		}
+	}
 
 	var db backend
+	var replicated *cluster
 	if cfg.Raft == nil {
 		local, err := openStore(cfg.Database, cfg.LeaseTime, cfg.MaxAttempts)
 		if err != nil {
@@ -74,7 +91,20 @@ func Run(ctx context.Context, cfg Config) error {
 		if cfg.ManagedWorkers {
 			raftConfig.Policy = "managed-workers-v1"
 		}
-		replicated, err := openCluster(raftConfig, cfg.LeaseTime, cfg.MaxAttempts)
+		var prepared *PreparedBackup
+		if cfg.RestoreBackup != "" {
+			prepared, err = PrepareBackup(ctx, cfg.RestoreBackup)
+			if err != nil {
+				return fmt.Errorf("prepare recovery backup: %w", err)
+			}
+			raftConfig.Seed = prepared
+		}
+		replicated, err = openCluster(raftConfig, cfg.LeaseTime, cfg.MaxAttempts)
+		if prepared != nil {
+			if closeErr := prepared.Close(); closeErr != nil {
+				cfg.Logger.Printf("remove staged recovery snapshot: %v", closeErr)
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("open coordinator Raft cluster: %w", err)
 		}
@@ -119,6 +149,11 @@ func Run(ctx context.Context, cfg Config) error {
 	for {
 		select {
 		case <-ticker.C:
+			if replicated != nil && cfg.Raft.ReplaceID != "" {
+				if err := replicated.node.ReconcileReplacement(ctx); err != nil && !errors.Is(err, ha.ErrUnavailable) {
+					cfg.Logger.Printf("reconcile Raft replacement: %v", err)
+				}
+			}
 			if err := db.Reap(ctx); err != nil && !errors.Is(err, ha.ErrUnavailable) {
 				cfg.Logger.Printf("reap leases: %v", err)
 			}
@@ -146,10 +181,13 @@ func validateAuthentication(cfg Config, remote bool) error {
 		}
 		return nil
 	}
-	if remote || cfg.ClientToken != "" || cfg.WorkerToken != "" {
+	if remote || cfg.EnableBackup || cfg.ClientToken != "" || cfg.WorkerToken != "" {
 		if !validAuthToken(cfg.ClientToken) || !validAuthToken(cfg.WorkerToken) || cfg.ClientToken == cfg.WorkerToken {
 			return errors.New("set distinct IDLEMESH_CLIENT_TOKEN and IDLEMESH_WORKER_TOKEN values (32–256 printable ASCII characters each, without spaces)")
 		}
+	}
+	if cfg.EnableBackup && (!validAuthToken(cfg.AdminToken) || cfg.AdminToken == cfg.ClientToken || cfg.AdminToken == cfg.WorkerToken) {
+		return errors.New("--enable-backup requires a valid IDLEMESH_ADMIN_TOKEN distinct from client and worker tokens")
 	}
 	return nil
 }
@@ -167,8 +205,9 @@ func validAuthToken(token string) bool {
 }
 
 type handler struct {
-	store backend
-	log   *log.Logger
+	store      backend
+	log        *log.Logger
+	backupSlot chan struct{}
 }
 
 func newHandler(s backend, cfg Config) http.Handler {
@@ -191,6 +230,10 @@ func newHandler(s backend, cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/worker/jobs/{id}/finish", authorizeWorker(cfg, h.finish))
 	if cfg.ManagedWorkers {
 		mux.HandleFunc("POST /v1/admin/worker-credentials", authorize(cfg.AdminToken, h.changeWorkerCredential))
+	}
+	if cfg.EnableBackup {
+		h.backupSlot = make(chan struct{}, 1)
+		mux.HandleFunc("GET "+api.BackupPath, authorize(cfg.AdminToken, h.backup))
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -249,6 +292,35 @@ func authorizeWorker(cfg Config, next func(http.ResponseWriter, *http.Request, s
 		// The backend authenticates this digest together with the requested
 		// operation, so a concurrent revocation cannot be bypassed.
 		next(w, r, digest)
+	}
+}
+
+func (h *handler) backup(w http.ResponseWriter, r *http.Request) {
+	select {
+	case h.backupSlot <- struct{}{}:
+		defer func() { <-h.backupSlot }()
+	default:
+		problem(w, http.StatusTooManyRequests, "a backup is already being prepared")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	if err := http.NewResponseController(w).SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		h.storeError(w, err)
+		return
+	}
+	archive, err := h.store.Backup(ctx)
+	if err != nil {
+		h.storeError(w, err)
+		return
+	}
+	defer archive.Close()
+	w.Header().Set("Content-Type", api.BackupContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(archive.Size, 10))
+	w.Header().Set("Content-Disposition", `attachment; filename="idlemesh-backup.imbackup"`)
+	if _, err := io.Copy(w, archive); err != nil {
+		h.log.Printf("stream backup: %v", err)
 	}
 }
 

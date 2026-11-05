@@ -125,11 +125,22 @@ func newPeerStream(cfg Config, peers []Peer, local Peer) (*peerStream, error) {
 		return nil, fmt.Errorf("invalid Raft TLS identity for %s: %w", local.ID, err)
 	}
 
-	roster, err := json.Marshal(peers)
+	var rosterScope any = peers
+	if cfg.ReplaceID != "" {
+		// An object starts in a separate hash domain from the old roster array.
+		// Include the full replacement plan and exact authentication policy.
+		rosterScope = struct {
+			Peers  []Peer `json:"peers"`
+			OldID  string `json:"old_id"`
+			NewID  string `json:"new_id"`
+			Policy []byte `json:"policy"`
+		}{peers, cfg.ReplaceID, cfg.ReplaceNewID, []byte(cfg.Policy)}
+	}
+	roster, err := json.Marshal(rosterScope)
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Policy != "" {
+	if cfg.ReplaceID == "" && cfg.Policy != "" {
 		// JSON never contains a literal NUL, so the roster and policy are
 		// unambiguous. The empty policy keeps the original v0.3 wire format.
 		roster = append(roster, 0)

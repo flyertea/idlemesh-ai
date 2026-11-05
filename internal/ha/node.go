@@ -1,4 +1,4 @@
-// Package ha runs a fixed three-voter Raft group over mutual TLS.
+// Package ha runs a three-voter Raft group over mutual TLS.
 package ha
 
 import (
@@ -32,16 +32,20 @@ var manifestKey = []byte("idlemesh-static-roster-v1")
 
 // Config defines one coordinator's Raft identity and peer transport.
 type Config struct {
-	ID        string
-	Listen    string // defaults to the local peer's advertised address
-	DataDir   string
-	Peers     []Peer // all three voters, including the local node
-	Bootstrap bool   // use only on the first startup of the lexically first ID
-	Policy    string // optional compatibility mode, negotiated only on the wire
-	TLSCert   string
-	TLSKey    string
-	TLSCA     string
-	LogOutput io.Writer
+	ID              string
+	Listen          string // defaults to the local peer's advertised address
+	DataDir         string
+	Peers           []Peer // all three voters, including the local node
+	Bootstrap       bool   // use only on the first startup of the lexically first ID
+	Policy          string // optional compatibility mode, negotiated only on the wire
+	ReplaceID       string // retired voter for the replacement epoch
+	ReplaceNewID    string // only this voter may join the epoch with an empty disk
+	JoinReplacement bool   // explicit first startup of the new voter only
+	Seed            io.Reader
+	TLSCert         string
+	TLSKey          string
+	TLSCA           string
+	LogOutput       io.Writer
 }
 
 // Peer identifies a voter and its advertised Raft address (host:port).
@@ -52,12 +56,18 @@ type Peer struct {
 
 // Node owns the Raft listener, state, and operation deadline handling.
 type Node struct {
-	raft      *raft.Raft
-	transport *raft.NetworkTransport
-	store     *raftbolt.BoltStore
-	pending   chan struct{}
-	closeOnce sync.Once
-	closeErr  error
+	raft        *raft.Raft
+	transport   *raft.NetworkTransport
+	store       *raftbolt.BoltStore
+	pending     chan struct{}
+	replacement *replacement
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+type nodeManifest struct {
+	ID    string `json:"local_id"`
+	Peers []Peer `json:"peers"`
 }
 
 // Open starts one voter. fsm must support deterministic replay and fresh
@@ -68,6 +78,9 @@ func Open(cfg Config, fsm raft.FSM) (*Node, error) {
 	}
 	peers, local, err := normalizePeers(cfg.ID, cfg.Peers)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateReplacementConfig(cfg, peers); err != nil {
 		return nil, err
 	}
 	if cfg.Bootstrap && local.ID != peers[0].ID {
@@ -102,10 +115,7 @@ func Open(cfg Config, fsm raft.FSM) (*Node, error) {
 			store.Close()
 		}
 	}()
-	manifest, err := json.Marshal(struct {
-		ID    string `json:"local_id"`
-		Peers []Peer `json:"peers"`
-	}{cfg.ID, peers})
+	manifest, err := json.Marshal(nodeManifest{cfg.ID, peers})
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +124,7 @@ func Open(cfg Config, fsm raft.FSM) (*Node, error) {
 	if err != nil && !newManifest {
 		return nil, fmt.Errorf("read Raft roster: %w", err)
 	}
-	if !newManifest && !bytes.Equal(saved, manifest) {
+	if cfg.ReplaceID == "" && !newManifest && !bytes.Equal(saved, manifest) {
 		return nil, errors.New("Raft data directory belongs to a different node or peer roster")
 	}
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "snapshots"), 0700); err != nil {
@@ -131,8 +141,15 @@ func Open(cfg Config, fsm raft.FSM) (*Node, error) {
 	if newManifest && hasState {
 		return nil, errors.New("existing Raft state has no IdleMesh roster")
 	}
+	if err := checkSeedState(store, cfg.Seed, cfg.Bootstrap, hasState); err != nil {
+		return nil, err
+	}
 	if cfg.Bootstrap && hasState {
 		return nil, errors.New("Raft state already exists; restart without bootstrap")
+	}
+	replacement, err := prepareReplacement(cfg, peers, store, snapshots, saved, hasState)
+	if err != nil {
+		return nil, err
 	}
 	if newManifest {
 		if err := store.Set(manifestKey, manifest); err != nil {
@@ -160,7 +177,7 @@ func Open(cfg Config, fsm raft.FSM) (*Node, error) {
 				ID: raft.ServerID(peer.ID), Address: raft.ServerAddress(peer.Address), Suffrage: raft.Voter,
 			})
 		}
-		if err := raft.BootstrapCluster(raftConfig, store, store, snapshots, transport, membership); err != nil {
+		if err := bootstrapWithSeed(raftConfig, store, snapshots, transport, membership, cfg.Seed); err != nil {
 			return nil, fmt.Errorf("bootstrap Raft: %w", err)
 		}
 	}
@@ -169,7 +186,7 @@ func Open(cfg Config, fsm raft.FSM) (*Node, error) {
 		return nil, fmt.Errorf("start Raft: %w", err)
 	}
 	opened = true
-	return &Node{raft: r, transport: transport, store: store, pending: make(chan struct{}, maxPending)}, nil
+	return &Node{raft: r, transport: transport, store: store, pending: make(chan struct{}, maxPending), replacement: replacement}, nil
 }
 
 // IsLeader is a routing hint. Apply and Barrier enforce quorum separately.

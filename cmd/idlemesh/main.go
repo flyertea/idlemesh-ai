@@ -63,6 +63,10 @@ func run(ctx context.Context, args []string) error {
 		return runWorker(ctx, args[1:])
 	case "worker-token":
 		return manageWorkerToken(ctx, args[1:])
+	case "backup":
+		return backupQueue(ctx, args[1:])
+	case "restore":
+		return restoreQueue(ctx, args[1:])
 	case "submit":
 		return submit(ctx, args[1:])
 	case "status":
@@ -80,6 +84,8 @@ func usage(w io.Writer) {
   coordinator   Serve a durable inference queue
   worker        Pull jobs and run local inference
   worker-token  Issue or revoke an individual worker credential
+  backup        Download a verified queue backup
+  restore       Restore a backup to a new standalone database
   submit        Submit a prompt and print its job ID
   status        Print a job's status as JSON
   wait          Wait for a job and print its final output
@@ -99,6 +105,8 @@ func runCoordinator(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.TLSKey, "tls-key", "", "PEM TLS private key file")
 	fs.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", false, "allow plaintext on a private encrypted network")
 	fs.BoolVar(&cfg.ManagedWorkers, "managed-workers", false, "require individual worker credentials instead of a shared token")
+	fs.BoolVar(&cfg.EnableBackup, "enable-backup", false, "allow the administrator to download queue backups")
+	fs.StringVar(&cfg.RestoreBackup, "restore-backup", "", "seed the first voter of a new Raft cluster from a backup archive")
 	raftConfig := addRaftFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -138,8 +146,9 @@ func (values *repeatedStrings) Set(value string) error {
 }
 
 type raftFlags struct {
-	node  ha.Config
-	peers repeatedStrings
+	node        ha.Config
+	peers       repeatedStrings
+	replacement string
 }
 
 func addRaftFlags(fs *flag.FlagSet) *raftFlags {
@@ -149,6 +158,8 @@ func addRaftFlags(fs *flag.FlagSet) *raftFlags {
 	fs.StringVar(&r.node.DataDir, "raft-dir", "", "local data directory for a replicated coordinator")
 	fs.Var(&r.peers, "raft-peer", "advertised peer in ID=HOST:PORT form; repeat for all three voters")
 	fs.BoolVar(&r.node.Bootstrap, "raft-bootstrap", false, "initialize a new cluster once, on the first peer ID only")
+	fs.StringVar(&r.replacement, "raft-replace", "", "replace one voter using OLD_ID=NEW_ID and the target peer roster")
+	fs.BoolVar(&r.node.JoinReplacement, "raft-join-replacement", false, "initialize the new replacement voter on its first startup only")
 	fs.StringVar(&r.node.TLSCert, "raft-tls-cert", "", "local Raft peer certificate (PEM)")
 	fs.StringVar(&r.node.TLSKey, "raft-tls-key", "", "local Raft peer private key (PEM)")
 	fs.StringVar(&r.node.TLSCA, "raft-tls-ca", "", "Raft peer certificate authority (PEM)")
@@ -162,6 +173,13 @@ func (r *raftFlags) config() (*ha.Config, error) {
 			return nil, errors.New("--raft-peer must use ID=HOST:PORT")
 		}
 		r.node.Peers = append(r.node.Peers, ha.Peer{ID: id, Address: address})
+	}
+	if r.replacement != "" {
+		old, next, ok := strings.Cut(r.replacement, "=")
+		if !ok || !api.ValidWorkerID(old) || !api.ValidWorkerID(next) || old == next {
+			return nil, errors.New("--raft-replace requires distinct OLD_ID=NEW_ID voter IDs")
+		}
+		r.node.ReplaceID, r.node.ReplaceNewID = old, next
 	}
 	r.node.LogOutput = os.Stderr
 	return &r.node, nil

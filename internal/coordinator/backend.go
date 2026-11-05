@@ -14,6 +14,7 @@ type backend interface {
 	Renew(ctx context.Context, id, token, workerDigest string) (*api.Lease, error)
 	Finish(ctx context.Context, id string, req api.FinishRequest, workerDigest string) error
 	ChangeWorkerCredential(ctx context.Context, req api.WorkerCredentialChange, key string) error
+	Backup(context.Context) (*Backup, error)
 	Reap(context.Context) error
 	Ready(context.Context) error
 }

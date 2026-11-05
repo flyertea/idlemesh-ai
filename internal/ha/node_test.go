@@ -265,6 +265,11 @@ func await(t *testing.T, description string, predicate func() bool) {
 
 func testCluster(t *testing.T) [3]Config {
 	t.Helper()
+	return [3]Config(testVoters(t, []string{"a", "b", "c"}))
+}
+
+func testVoters(t *testing.T, ids []string) []Config {
+	t.Helper()
 	dir := t.TempDir()
 	var listeners []net.Listener
 	defer func() {
@@ -273,7 +278,7 @@ func testCluster(t *testing.T) [3]Config {
 		}
 	}()
 	var peers []Peer
-	for _, id := range []string{"a", "b", "c"} {
+	for _, id := range ids {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -308,7 +313,7 @@ func testCluster(t *testing.T) [3]Config {
 		t.Fatal(err)
 	}
 	caFile := writeCert("ca", caDER)
-	var configs [3]Config
+	configs := make([]Config, len(peers))
 	for index, peer := range peers {
 		key := newKey()
 		cert := &x509.Certificate{

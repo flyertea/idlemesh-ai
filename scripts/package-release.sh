@@ -22,10 +22,7 @@ mkdir -p "$package_dir/docs" "$licenses" "$artifacts"
 
 cd "$repo_root"
 cp README.md LICENSE "$package_dir/"
-cp docs/architecture.md "$package_dir/docs/"
-if [[ -f docs/ha-setup.md ]]; then
-    cp docs/ha-setup.md "$package_dir/docs/"
-fi
+cp docs/*.md "$package_dir/docs/"
 
 go_root=$(go env GOROOT)
 go_license="$go_root/LICENSE"
