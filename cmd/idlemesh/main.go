@@ -12,11 +12,13 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/flyertea/idlemesh-ai/internal/api"
 	"github.com/flyertea/idlemesh-ai/internal/coordinator"
+	"github.com/flyertea/idlemesh-ai/internal/ha"
 	"github.com/flyertea/idlemesh-ai/internal/worker"
 )
 
@@ -92,16 +94,71 @@ func runCoordinator(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.TLSCert, "tls-cert", "", "PEM TLS certificate file")
 	fs.StringVar(&cfg.TLSKey, "tls-key", "", "PEM TLS private key file")
 	fs.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", false, "allow plaintext on a private encrypted network")
+	raftConfig := addRaftFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return errors.New("coordinator does not accept positional arguments")
 	}
+	var raftEnabled, databaseSelected bool
+	fs.Visit(func(f *flag.Flag) {
+		raftEnabled = raftEnabled || strings.HasPrefix(f.Name, "raft-")
+		databaseSelected = databaseSelected || f.Name == "db"
+	})
+	if raftEnabled {
+		if databaseSelected {
+			return errors.New("--db is for standalone mode; --raft-dir stores separate cluster state")
+		}
+		var err error
+		cfg.Raft, err = raftConfig.config()
+		if err != nil {
+			return err
+		}
+	}
 	cfg.ClientToken = os.Getenv(clientToken)
 	cfg.WorkerToken = os.Getenv(workerToken)
 	cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	return coordinator.Run(ctx, cfg)
+}
+
+type repeatedStrings []string
+
+func (values *repeatedStrings) String() string { return strings.Join(*values, ", ") }
+
+func (values *repeatedStrings) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
+type raftFlags struct {
+	node  ha.Config
+	peers repeatedStrings
+}
+
+func addRaftFlags(fs *flag.FlagSet) *raftFlags {
+	r := &raftFlags{}
+	fs.StringVar(&r.node.ID, "raft-id", "", "local coordinator ID in the Raft roster")
+	fs.StringVar(&r.node.Listen, "raft-listen", "", "local Raft TCP bind address; defaults to the advertised peer address")
+	fs.StringVar(&r.node.DataDir, "raft-dir", "", "local data directory for a replicated coordinator")
+	fs.Var(&r.peers, "raft-peer", "advertised peer in ID=HOST:PORT form; repeat for all three voters")
+	fs.BoolVar(&r.node.Bootstrap, "raft-bootstrap", false, "initialize a new cluster once, on the first peer ID only")
+	fs.StringVar(&r.node.TLSCert, "raft-tls-cert", "", "local Raft peer certificate (PEM)")
+	fs.StringVar(&r.node.TLSKey, "raft-tls-key", "", "local Raft peer private key (PEM)")
+	fs.StringVar(&r.node.TLSCA, "raft-tls-ca", "", "Raft peer certificate authority (PEM)")
+	return r
+}
+
+func (r *raftFlags) config() (*ha.Config, error) {
+	for _, raw := range r.peers {
+		id, address, ok := strings.Cut(raw, "=")
+		if !ok || id == "" || address == "" {
+			return nil, errors.New("--raft-peer must use ID=HOST:PORT")
+		}
+		r.node.Peers = append(r.node.Peers, ha.Peer{ID: id, Address: address})
+	}
+	r.node.LogOutput = os.Stderr
+	return &r.node, nil
 }
 
 func runWorker(ctx context.Context, args []string) error {
@@ -155,19 +212,23 @@ func runWorker(ctx context.Context, args []string) error {
 }
 
 type serverFlags struct {
-	url           string
+	urls          repeatedStrings
 	allowInsecure bool
 }
 
 func addServerFlags(fs *flag.FlagSet) *serverFlags {
 	s := new(serverFlags)
-	fs.StringVar(&s.url, "server", defaultServer, "coordinator HTTP(S) origin")
+	fs.Var(&s.urls, "server", "coordinator HTTP(S) origin; repeat for HA (default "+defaultServer+")")
 	fs.BoolVar(&s.allowInsecure, "allow-insecure-http", false, "allow non-loopback plaintext on a private encrypted network")
 	return s
 }
 
 func (s *serverFlags) client(env string) (*api.Client, error) {
-	return api.NewClient(s.url, os.Getenv(env), s.allowInsecure)
+	urls := []string(s.urls)
+	if len(urls) == 0 {
+		urls = []string{defaultServer}
+	}
+	return api.NewClusterClient(urls, os.Getenv(env), s.allowInsecure)
 }
 
 func submit(ctx context.Context, args []string) error {
@@ -178,6 +239,7 @@ func submit(ctx context.Context, args []string) error {
 	fs.StringVar(&req.Model, "model", "", "exact Ollama model tag")
 	fs.StringVar(&req.Prompt, "prompt", "", "text to send to the model")
 	promptFile := fs.String("prompt-file", "", "read the prompt from a UTF-8 file or from stdin with '-'")
+	requestID := fs.String("request-id", "", "stable idempotency key for retries of the same prompt and options")
 	fs.IntVar(&req.MaxTokens, "max-tokens", 256, "maximum generated tokens (1–4096)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -202,7 +264,12 @@ func submit(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	job, err := client.Submit(ctx, req)
+	var job api.Job
+	if *requestID != "" {
+		job, err = client.SubmitWithKey(ctx, req, *requestID)
+	} else {
+		job, err = client.Submit(ctx, req)
+	}
 	if err != nil {
 		return err
 	}

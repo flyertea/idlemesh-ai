@@ -14,6 +14,8 @@ const (
 	MaxOutputBytes = 256 << 10
 	MaxErrorBytes  = 1024
 	MaxBodyBytes   = 2 << 20
+
+	IdempotencyKeyHeader = "Idempotency-Key"
 )
 
 const (
@@ -59,6 +61,8 @@ type Lease struct {
 	MaxTokens int    `json:"max_tokens,omitempty"`
 	Attempt   int    `json:"attempt,omitempty"`
 	TTLMillis int64  `json:"ttl_ms"`
+	// RequestStarted is the local monotonic start of the successful HTTP attempt.
+	RequestStarted time.Time `json:"-"`
 }
 
 type LeaseRequest struct {
@@ -72,8 +76,9 @@ type FinishRequest struct {
 }
 
 var (
-	modelPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_./:-]{0,127}$`)
-	idPattern    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+	modelPattern          = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_./:-]{0,127}$`)
+	idPattern             = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+	idempotencyKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,128}$`)
 )
 
 func ValidCapability(engine, model string) bool {
@@ -89,6 +94,10 @@ func ValidCapability(engine, model string) bool {
 
 func ValidWorkerID(id string) bool {
 	return idPattern.MatchString(id)
+}
+
+func ValidIdempotencyKey(key string) bool {
+	return idempotencyKeyPattern.MatchString(key)
 }
 
 func ValidPrompt(prompt string) bool {

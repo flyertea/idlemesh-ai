@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
@@ -17,13 +18,18 @@ import (
 const maxActiveJobs = 1024
 
 var (
-	jobsBucket   = []byte("jobs-v1")
-	activeBucket = []byte("active-v1")
-	errNotFound  = errors.New("job not found")
-	errStale     = errors.New("lease is expired or no longer current")
-	errQueueFull = errors.New("queue is full")
-	errNoWork    = errors.New("no matching work")
+	jobsBucket     = []byte("jobs-v1")
+	activeBucket   = []byte("active-v1")
+	submitKeys     = []byte("submit-keys-v1")
+	claimKeys      = []byte("claim-keys-v1")
+	errNotFound    = errors.New("job not found")
+	errStale       = errors.New("lease is expired or no longer current")
+	errQueueFull   = errors.New("queue is full")
+	errNoWork      = errors.New("no matching work")
+	errKeyConflict = errors.New("idempotency key was used with different input")
 )
+
+var stateBuckets = [][]byte{jobsBucket, activeBucket, submitKeys, claimKeys}
 
 type record struct {
 	api.Job
@@ -46,11 +52,12 @@ func openStore(path string, leaseTime time.Duration, maxAttempts int) (*store, e
 		return nil, err
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(jobsBucket); err != nil {
-			return err
+		for _, bucket := range stateBuckets {
+			if _, err := tx.CreateBucketIfNotExists(bucket); err != nil {
+				return err
+			}
 		}
-		_, err := tx.CreateBucketIfNotExists(activeBucket)
-		return err
+		return nil
 	})
 	if err != nil {
 		db.Close()
@@ -59,9 +66,44 @@ func openStore(path string, leaseTime time.Duration, maxAttempts int) (*store, e
 	return &store{db: db, leaseTime: leaseTime, maxAttempts: maxAttempts}, nil
 }
 
+type submitted struct {
+	Key  []byte   `json:"key"`
+	Hash [32]byte `json:"hash"`
+}
+
+type claimed struct {
+	Key     []byte           `json:"key"`
+	Token   string           `json:"token"`
+	Request api.ClaimRequest `json:"request"`
+}
+
 func (s *store) submit(req api.SubmitRequest) (api.Job, error) {
+	return s.submitAt(req, "", time.Now().UTC(), s.maxAttempts)
+}
+
+func (s *store) submitAt(req api.SubmitRequest, requestKey string, now time.Time, maxAttempts int) (api.Job, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return api.Job{}, err
+	}
+	hash := sha256.Sum256(data)
 	var job api.Job
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		keys := tx.Bucket(submitKeys)
+		if requestKey != "" {
+			if value := keys.Get([]byte(requestKey)); value != nil {
+				var saved submitted
+				if err := json.Unmarshal(value, &saved); err != nil {
+					return err
+				}
+				if saved.Hash != hash {
+					return errKeyConflict
+				}
+				r, err := load(tx, saved.Key)
+				job = r.Job
+				return err
+			}
+		}
 		active := tx.Bucket(activeBucket)
 		if active.Stats().KeyN >= maxActiveJobs {
 			return errQueueFull
@@ -71,15 +113,19 @@ func (s *store) submit(req api.SubmitRequest) (api.Job, error) {
 		if err != nil {
 			return err
 		}
-		now := time.Now().UTC()
 		job = api.Job{
 			ID: strconv.FormatUint(seq, 16), State: api.Queued,
-			Engine: req.Engine, Model: req.Model, MaxAttempts: s.maxAttempts,
+			Engine: req.Engine, Model: req.Model, MaxAttempts: maxAttempts,
 			CreatedAt: now, UpdatedAt: now,
 		}
 		key := binary.BigEndian.AppendUint64(nil, seq)
 		if err := put(tx, key, record{Job: job, Prompt: req.Prompt, MaxTokens: req.MaxTokens}); err != nil {
 			return err
+		}
+		if requestKey != "" {
+			if err := putJSON(keys, []byte(requestKey), submitted{Key: key, Hash: hash}); err != nil {
+				return err
+			}
 		}
 		return active.Put(key, nil)
 	})
@@ -100,10 +146,46 @@ func (s *store) status(id string) (api.Job, error) {
 	return job, err
 }
 
+func newLeaseToken() (string, error) {
+	var random [32]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(random[:]), nil
+}
+
 func (s *store) claim(req api.ClaimRequest) (*api.Lease, error) {
+	token, err := newLeaseToken()
+	if err != nil {
+		return nil, err
+	}
+	return s.claimAt(req, "", token, time.Now().UTC(), s.leaseTime)
+}
+
+func (s *store) claimAt(req api.ClaimRequest, requestKey, token string, now time.Time, leaseTime time.Duration) (*api.Lease, error) {
 	var lease *api.Lease
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		now := time.Now().UTC()
+		keys := tx.Bucket(claimKeys)
+		if requestKey != "" {
+			if value := keys.Get([]byte(requestKey)); value != nil {
+				var saved claimed
+				if err := json.Unmarshal(value, &saved); err != nil {
+					return err
+				}
+				if saved.Request != req {
+					return errKeyConflict
+				}
+				r, err := load(tx, saved.Key)
+				if err != nil {
+					return err
+				}
+				if r.validLease(saved.Token, now) {
+					lease = r.lease(now)
+				}
+				return errNoWork // An idempotent replay does not need a write.
+			}
+		}
+
 		cursor := tx.Bucket(activeBucket).Cursor()
 		for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
 			r, err := load(tx, key)
@@ -115,55 +197,69 @@ func (s *store) claim(req api.ClaimRequest) (*api.Lease, error) {
 				continue
 			}
 
-			var random [32]byte
-			if _, err := rand.Read(random[:]); err != nil {
-				return err
-			}
-			r.Token = hex.EncodeToString(random[:])
+			r.Token = token
 			r.State = api.Running
 			r.Attempt++
 			r.WorkerID = req.WorkerID
 			r.Error = ""
-			r.UpdatedAt = now
-			r.DueAt = now.Add(s.leaseTime)
-			lease = &api.Lease{
-				ID: r.ID, Token: r.Token, Prompt: r.Prompt, Engine: r.Engine, Model: r.Model,
-				MaxTokens: r.MaxTokens, Attempt: r.Attempt, TTLMillis: s.leaseTime.Milliseconds(),
+			r.UpdatedAt = maxTime(r.UpdatedAt, now)
+			r.DueAt = now.Add(leaseTime)
+			lease = r.lease(now)
+			if requestKey != "" {
+				if err := putJSON(keys, []byte(requestKey), claimed{Key: key, Token: token, Request: req}); err != nil {
+					return err
+				}
 			}
 			return put(tx, key, r)
 		}
 		return errNoWork
 	})
 	if errors.Is(err, errNoWork) {
-		return nil, nil
+		return lease, nil
 	}
 	return lease, err
 }
 
+func (r record) lease(now time.Time) *api.Lease {
+	return &api.Lease{
+		ID: r.ID, Token: r.Token, Prompt: r.Prompt, Engine: r.Engine, Model: r.Model,
+		MaxTokens: r.MaxTokens, Attempt: r.Attempt, TTLMillis: r.DueAt.Sub(now).Milliseconds(),
+	}
+}
+
 func (s *store) renew(id, token string) (*api.Lease, error) {
+	return s.renewAt(id, token, time.Now().UTC(), s.leaseTime)
+}
+
+func (s *store) renewAt(id, token string, now time.Time, leaseTime time.Duration) (*api.Lease, error) {
 	key, err := jobKey(id)
 	if err != nil {
 		return nil, err
 	}
+	var ttl time.Duration
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		r, err := load(tx, key)
 		if err != nil {
 			return err
 		}
-		now := time.Now().UTC()
 		if !r.validLease(token, now) {
 			return errStale
 		}
-		r.DueAt = now.Add(s.leaseTime)
+		r.DueAt = maxTime(r.DueAt, now.Add(leaseTime))
+		ttl = min(leaseTime, r.DueAt.Sub(now))
 		return put(tx, key, r)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &api.Lease{ID: id, TTLMillis: s.leaseTime.Milliseconds()}, nil
+	return &api.Lease{ID: id, TTLMillis: ttl.Milliseconds()}, nil
 }
 
 func (s *store) finish(id string, req api.FinishRequest) error {
+	return s.finishAt(id, req, time.Now().UTC())
+}
+
+func (s *store) finishAt(id string, req api.FinishRequest, now time.Time) error {
 	key, err := jobKey(id)
 	if err != nil {
 		return err
@@ -176,13 +272,12 @@ func (s *store) finish(id string, req api.FinishRequest) error {
 		if equalToken(r.LastFinished, req.Token) {
 			return nil
 		}
-		now := time.Now().UTC()
 		if !r.validLease(req.Token, now) {
 			return errStale
 		}
 		r.LastFinished = r.Token
 		r.Token = ""
-		r.UpdatedAt = now
+		r.UpdatedAt = maxTime(r.UpdatedAt, now)
 		if req.Error == "" {
 			r.State = api.Succeeded
 			r.Output = req.Output
@@ -201,9 +296,12 @@ func (s *store) finish(id string, req api.FinishRequest) error {
 
 // Reflect expired leases in job status even when no worker is available.
 func (s *store) reap() error {
+	return s.reapAt(time.Now().UTC())
+}
+
+func (s *store) expiredJobs(now time.Time) ([][]byte, error) {
 	var expired [][]byte
 	err := s.db.View(func(tx *bolt.Tx) error {
-		now := time.Now().UTC()
 		return tx.Bucket(activeBucket).ForEach(func(key, _ []byte) error {
 			r, err := load(tx, key)
 			if err == nil && r.expired(now) {
@@ -212,11 +310,15 @@ func (s *store) reap() error {
 			return err
 		})
 	})
+	return expired, err
+}
+
+func (s *store) reapAt(now time.Time) error {
+	expired, err := s.expiredJobs(now)
 	if err != nil || len(expired) == 0 {
 		return err
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
-		now := time.Now().UTC()
 		for _, key := range expired {
 			r, err := load(tx, key)
 			if err != nil {
@@ -224,7 +326,7 @@ func (s *store) reap() error {
 			}
 			if r.expired(now) {
 				r.Error = "worker lease expired before a result was received"
-				r.UpdatedAt = now
+				r.UpdatedAt = maxTime(r.UpdatedAt, now)
 				if r.Attempt >= r.MaxAttempts {
 					r.State = api.Failed
 					if err := terminal(tx, key, r); err != nil {
@@ -274,11 +376,22 @@ func load(tx *bolt.Tx, key []byte) (record, error) {
 }
 
 func put(tx *bolt.Tx, key []byte, r record) error {
-	data, err := json.Marshal(r)
+	return putJSON(tx.Bucket(jobsBucket), key, r)
+}
+
+func putJSON(bucket *bolt.Bucket, key []byte, value any) error {
+	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	return tx.Bucket(jobsBucket).Put(key, data)
+	return bucket.Put(key, data)
+}
+
+func maxTime(first, second time.Time) time.Time {
+	if first.After(second) {
+		return first
+	}
+	return second
 }
 
 func terminal(tx *bolt.Tx, key []byte, r record) error {

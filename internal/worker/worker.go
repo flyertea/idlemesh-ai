@@ -58,6 +58,9 @@ func Run(ctx context.Context, client *api.Client, runner Runner, cfg Config) err
 			wait(ctx, cfg.PollInterval)
 			continue
 		}
+		if !lease.RequestStarted.IsZero() {
+			claimStarted = lease.RequestStarted
+		}
 		ttl := leaseTTL(lease)
 		if ttl <= 0 || lease.ID == "" || lease.Token == "" || lease.Model != cfg.Model ||
 			lease.Engine != cfg.Engine || lease.MaxTokens < 1 {
@@ -150,6 +153,9 @@ func renew(ctx context.Context, client *api.Client, cfg Config, lease *api.Lease
 					return
 				}
 				grantedAt = started
+				if !update.RequestStarted.IsZero() {
+					grantedAt = update.RequestStarted
+				}
 				break
 			}
 			if ctx.Err() != nil {

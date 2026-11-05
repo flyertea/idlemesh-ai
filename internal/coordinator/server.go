@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/flyertea/idlemesh-ai/internal/api"
+	"github.com/flyertea/idlemesh-ai/internal/ha"
 )
 
 type Config struct {
@@ -29,6 +30,7 @@ type Config struct {
 	WorkerToken       string
 	AllowInsecureHTTP bool
 	Logger            *log.Logger
+	Raft              *ha.Config
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -60,11 +62,22 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Logger = log.Default()
 	}
 
-	db, err := openStore(cfg.Database, cfg.LeaseTime, cfg.MaxAttempts)
-	if err != nil {
-		return fmt.Errorf("open coordinator database: %w", err)
+	var db backend
+	if cfg.Raft == nil {
+		local, err := openStore(cfg.Database, cfg.LeaseTime, cfg.MaxAttempts)
+		if err != nil {
+			return fmt.Errorf("open coordinator database: %w", err)
+		}
+		defer local.db.Close()
+		db = local
+	} else {
+		replicated, err := openCluster(*cfg.Raft, cfg.LeaseTime, cfg.MaxAttempts)
+		if err != nil {
+			return fmt.Errorf("open coordinator Raft cluster: %w", err)
+		}
+		defer replicated.close()
+		db = replicated
 	}
-	defer db.db.Close()
 
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -103,7 +116,7 @@ func Run(ctx context.Context, cfg Config) error {
 	for {
 		select {
 		case <-ticker.C:
-			if err := db.reap(); err != nil {
+			if err := db.Reap(ctx); err != nil && !errors.Is(err, ha.ErrUnavailable) {
 				cfg.Logger.Printf("reap leases: %v", err)
 			}
 		case err := <-serveResult:
@@ -133,16 +146,23 @@ func validAuthToken(token string) bool {
 }
 
 type handler struct {
-	store *store
+	store backend
 	log   *log.Logger
 }
 
-func newHandler(s *store, cfg Config) http.Handler {
+func newHandler(s backend, cfg Config) http.Handler {
 	h := &handler{store: s, log: cfg.Logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /readyz", authorize(cfg.ClientToken, func(w http.ResponseWriter, r *http.Request) {
+		if err := h.store.Ready(r.Context()); err != nil {
+			h.storeError(w, err)
+			return
+		}
+		reply(w, http.StatusOK, map[string]string{"status": "ready"})
+	}))
 	mux.HandleFunc("POST /v1/jobs", authorize(cfg.ClientToken, h.submit))
 	mux.HandleFunc("GET /v1/jobs/{id}", authorize(cfg.ClientToken, h.status))
 	mux.HandleFunc("POST /v1/worker/claim", authorize(cfg.WorkerToken, h.claim))
@@ -186,7 +206,11 @@ func (h *handler) submit(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "invalid engine, model, prompt, or max_tokens (1–4096)")
 		return
 	}
-	job, err := h.store.submit(req)
+	key, valid := idempotencyKey(w, r)
+	if !valid {
+		return
+	}
+	job, err := h.store.Submit(r.Context(), req, key)
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -195,7 +219,7 @@ func (h *handler) submit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) status(w http.ResponseWriter, r *http.Request) {
-	job, err := h.store.status(r.PathValue("id"))
+	job, err := h.store.Status(r.Context(), r.PathValue("id"))
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -212,7 +236,11 @@ func (h *handler) claim(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "invalid worker_id, engine, or model")
 		return
 	}
-	lease, err := h.store.claim(req)
+	key, valid := idempotencyKey(w, r)
+	if !valid {
+		return
+	}
+	lease, err := h.store.Claim(r.Context(), req, key)
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -233,7 +261,7 @@ func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "invalid lease token")
 		return
 	}
-	lease, err := h.store.renew(r.PathValue("id"), req.Token)
+	lease, err := h.store.Renew(r.Context(), r.PathValue("id"), req.Token)
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -251,11 +279,23 @@ func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "invalid lease token, output, or error")
 		return
 	}
-	if err := h.store.finish(r.PathValue("id"), req); err != nil {
+	if err := h.store.Finish(r.Context(), r.PathValue("id"), req); err != nil {
 		h.storeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func idempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	values := r.Header.Values(api.IdempotencyKeyHeader)
+	if len(values) == 0 {
+		return "", true
+	}
+	if len(values) != 1 || !api.ValidIdempotencyKey(values[0]) {
+		problem(w, http.StatusBadRequest, "invalid Idempotency-Key")
+		return "", false
+	}
+	return values[0], true
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -294,6 +334,10 @@ func (h *handler) storeError(w http.ResponseWriter, err error) {
 		problem(w, http.StatusConflict, errStale.Error())
 	case errors.Is(err, errQueueFull):
 		problem(w, http.StatusServiceUnavailable, errQueueFull.Error())
+	case errors.Is(err, errKeyConflict):
+		problem(w, http.StatusConflict, errKeyConflict.Error())
+	case errors.Is(err, ha.ErrUnavailable):
+		problem(w, http.StatusServiceUnavailable, "no ready coordinator leader at this endpoint")
 	default:
 		h.log.Printf("database operation failed: %v", err)
 		problem(w, http.StatusInternalServerError, "database operation failed")
