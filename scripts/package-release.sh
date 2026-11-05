@@ -31,11 +31,13 @@ if [[ ! -f $go_license ]]; then
     go_license="$go_root/../LICENSE"
 fi
 cp "$go_license" "$licenses/go-LICENSE"
-go mod download go.etcd.io/bbolt golang.org/x/sys
+go mod download go.etcd.io/bbolt golang.org/x/sys github.com/ebitengine/purego
 bbolt_dir=$(go list -m -f '{{.Dir}}' go.etcd.io/bbolt)
 x_sys_dir=$(go list -m -f '{{.Dir}}' golang.org/x/sys)
+purego_dir=$(go list -m -f '{{.Dir}}' github.com/ebitengine/purego)
 cp "$bbolt_dir/LICENSE" "$licenses/bbolt-LICENSE"
 cp "$x_sys_dir/LICENSE" "$licenses/x-sys-LICENSE"
+cp "$purego_dir/LICENSE" "$licenses/purego-LICENSE"
 
 for os in darwin linux windows; do
     binary=idlemesh

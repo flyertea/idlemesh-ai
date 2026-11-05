@@ -78,7 +78,7 @@ func TestCLIProcessRoundTrip(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for coordinator to listen")
 	}
-	start(command("worker", "--server", address, "--id", "cli-smoke", "--engine", "echo", "--poll", "50ms"))
+	start(command("worker", "--server", address, "--id", "cli-smoke", "--engine", "echo", "--always-claim", "--poll", "50ms"))
 
 	const prompt = "你好，IdleMesh！"
 	id := run("submit", "--server", address, "--engine", "echo", "--prompt", prompt)

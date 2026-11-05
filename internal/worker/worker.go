@@ -21,6 +21,7 @@ type Config struct {
 	PollInterval time.Duration
 	JobTimeout   time.Duration
 	Logger       *log.Logger
+	Admission    *Admission
 }
 
 // Run claims one job at a time until ctx is canceled.
@@ -35,6 +36,9 @@ func Run(ctx context.Context, client *api.Client, runner Runner, cfg Config) err
 	request := api.ClaimRequest{WorkerID: cfg.ID, Engine: cfg.Engine, Model: cfg.Model}
 	var retry time.Duration
 	for ctx.Err() == nil {
+		if cfg.Admission != nil && !cfg.Admission.wait(ctx, cfg.Logger) {
+			return nil
+		}
 		claimStarted := time.Now()
 		lease, err := client.Claim(ctx, request)
 		if err != nil {
@@ -61,6 +65,9 @@ func Run(ctx context.Context, client *api.Client, runner Runner, cfg Config) err
 		}
 		if err := runLease(ctx, client, runner, cfg, lease, claimStarted, ttl); err != nil {
 			return err
+		}
+		if cfg.Admission != nil {
+			cfg.Admission.reset()
 		}
 	}
 	return nil

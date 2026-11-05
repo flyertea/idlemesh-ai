@@ -117,6 +117,12 @@ func runWorker(ctx context.Context, args []string) error {
 	threads := fs.Int("threads", min(2, runtime.NumCPU()), "Ollama inference CPU threads")
 	contextLength := fs.Int("context", 2048, "Ollama context length in tokens")
 	echoDelay := fs.Duration("echo-delay", 0, "execution delay for the echo engine")
+	alwaysClaim := fs.Bool("always-claim", false, "disable CPU, memory and battery admission checks")
+	var resources worker.AdmissionConfig
+	fs.Float64Var(&resources.CPUPercent, "idle-cpu-percent", 25, "maximum system CPU utilization percent for new jobs")
+	fs.Uint64Var(&resources.MinMemoryMiB, "idle-min-memory-mib", 2048, "minimum available physical memory in MiB for new jobs")
+	fs.DurationVar(&resources.IdleFor, "idle-for", 6*time.Second, "duration of healthy samples before taking new jobs")
+	fs.DurationVar(&resources.CheckInterval, "idle-check", 2*time.Second, "minimum interval between host resource samples")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -129,6 +135,12 @@ func runWorker(ctx context.Context, args []string) error {
 	client, err := server.client(workerToken)
 	if err != nil {
 		return err
+	}
+	if !*alwaysClaim {
+		cfg.Admission, err = worker.NewAdmission(resources)
+		if err != nil {
+			return err
+		}
 	}
 	runner := worker.Echo(*echoDelay)
 	if cfg.Engine == "ollama" {

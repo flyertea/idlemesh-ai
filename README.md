@@ -2,15 +2,15 @@
 
 把多台 Windows、macOS 和 Linux 电脑组成一个文本生成任务池。每台电脑用本机 CPU 和内存运行量化模型，通过网络领取任务。增加节点可以同时处理更多独立请求，执行中的节点离线后，其他持有相同模型的节点可以接手重算。
 
-首版面向可信局域网或私有 VPN。一个协调器持久保存任务，Worker 主动连接协调器，无需开放 Worker 入站端口。故障恢复以任务为单位，等待租约到期后从头生成。单个模型需要装入单台电脑的可用内存，协调器也需要在线才能继续分发任务。 [架构与实施路线](docs/architecture.md)
+面向可信局域网或私有 VPN。一个协调器持久保存任务，Worker 主动连接协调器，无需开放 Worker 入站端口。故障恢复以任务为单位，等待租约到期后从头生成。单个模型需要装入单台电脑的可用内存，协调器也需要在线才能继续分发任务。 [架构与实施路线](docs/architecture.md)
 
 ## 下载
 
-下载并解压与操作系统、处理器对应的 ZIP。`amd64` 适用于 Intel 和 AMD 的 64 位处理器，`arm64` 适用于 Apple 芯片及其他 64 位 ARM 处理器。压缩包名例如 `idlemesh-v0.1.0-darwin-arm64.zip`。可以用发布页的 `SHA256SUMS` 核对下载。 [GitHub Releases](https://github.com/flyertea/idlemesh-ai/releases)
+下载并解压与操作系统、处理器对应的 ZIP。`amd64` 适用于 Intel 和 AMD 的 64 位处理器，`arm64` 适用于 Apple 芯片及其他 64 位 ARM 处理器。压缩包名例如 `idlemesh-v0.2.0-darwin-arm64.zip`。可以用发布页的 `SHA256SUMS` 核对下载。 [GitHub Releases](https://github.com/flyertea/idlemesh-ai/releases)
 
 ## 五分钟跑通
 
-回显模式无需安装模型，适合先验证连接和任务调度。以下三个命令分别在三个终端运行，都从解压目录开始。
+回显模式无需安装模型，适合先验证连接和任务调度。这个演练用 `--always-claim` 跳过资源检查，在电池供电的笔记本上也能跑通。以下三个步骤分别在三个终端运行，都从解压目录开始。
 
 **终端 1 · 启动协调器**
 
@@ -21,7 +21,7 @@
 **终端 2 · 启动一个 Worker**
 
 ```sh
-./idlemesh worker --id worker-a --engine echo
+./idlemesh worker --id worker-a --engine echo --always-claim
 ```
 
 **终端 3 · 提交并等待结果**
@@ -32,7 +32,7 @@ job=$(./idlemesh submit --engine echo --prompt '你好，IdleMesh！')
 ./idlemesh wait "$job"
 ```
 
-在 Windows PowerShell 中，前两个终端分别运行 `.\idlemesh.exe coordinator` 和 `.\idlemesh.exe worker --id worker-a --engine echo`。第三个终端运行下面的命令。
+在 Windows PowerShell 中，前两个终端分别运行 `.\idlemesh.exe coordinator` 和 `.\idlemesh.exe worker --id worker-a --engine echo --always-claim`。第三个终端运行下面的命令。
 
 ```powershell
 $job = .\idlemesh.exe submit --engine echo --prompt '你好，IdleMesh！'
@@ -58,11 +58,32 @@ job=$(./idlemesh submit --model qwen2.5:0.5b --max-tokens 64 --prompt '用两句
 ./idlemesh wait "$job"
 ```
 
-Windows 使用 `.\idlemesh.exe` 并用 `$job =` 接收任务 ID。Worker 请求本机 Ollama 做 CPU 推理，任务结束后请求释放模型。`--threads` 限制推理线程数，`--context` 控制模型上下文大小。首版由机主决定何时启动或停止 Worker。可以用 `ollama ps` 在模型运行时查看 `PROCESSOR` 栏。 [Ollama FAQ](https://docs.ollama.com/faq)
+Windows 使用 `.\idlemesh.exe` 并用 `$job =` 接收任务 ID。Worker 请求本机 Ollama 做 CPU 推理，任务结束后请求释放模型。`--threads` 限制推理线程数，`--context` 控制模型上下文大小。可以用 `ollama ps` 在模型运行时查看 `PROCESSOR` 栏。 [Ollama FAQ](https://docs.ollama.com/faq)
 
 `submit --prompt-file prompt.txt` 从 UTF-8 文件读取提示词，`submit --prompt-file -` 从标准输入读取。两种形式都可以搭配 `--model` 或 `--engine echo`。单条提示词最大 32 KiB。
 
 如果希望同时关闭本机 Ollama 的云功能，在 Ollama 进程的环境中设置 `OLLAMA_NO_CLOUD=1`，再重启 Ollama。 [Ollama 云功能设置](https://docs.ollama.com/faq#how-do-i-disable-ollamas-cloud-features)
+
+## 只在有空闲资源时接单
+
+从 v0.2 起，两种 Worker 默认都检查整台电脑的 CPU、可用内存和外部供电。切换到电池、资源不足或读不到指标时，Worker 暂停领取新任务，待符合条件一段时间后自动恢复。已领取的任务继续运行，完成后重新观察空闲状态。
+
+| Worker 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `--idle-cpu-percent` | `25` | 整机 CPU 使用率上限，单位为百分比 |
+| `--idle-min-memory-mib` | `2048` | 可用内存下限，单位为 MiB |
+| `--idle-for` | `6s` | 满足条件后再接单所需的持续时间 |
+| `--idle-check` | `2s` | 资源采样间隔 |
+
+例如，给内存余量要求较高的节点设置至少 3 GiB 可用内存和 10 秒的稳定窗口。
+
+```sh
+./idlemesh worker --id cpu-a --model qwen2.5:0.5b --idle-min-memory-mib 3072 --idle-for 10s
+```
+
+任务长期处于 `queued` 时，先检查对应 Worker 的终端或标准错误日志。`paused claiming` 后会写明暂停原因，例如 CPU 繁忙、内存不足、电池供电或无法取得可靠读数。`resources ready` 表示节点恢复接单。阈值用于接单前判断，实际推理的 CPU 和内存需求还取决于模型、线程数及上下文。
+
+专用计算节点或受控演练可用 `--always-claim` 恢复 v0.1 的接单行为，同时跳过 CPU、内存和供电检查。
 
 ## 让其他电脑加入
 
@@ -94,13 +115,13 @@ job=$(./idlemesh submit --server https://mesh.example.net:8787 --model qwen2.5:0
 
 在同一电脑开多个终端也能验证调度。保持默认协调器运行，关闭之前的回显 Worker，然后按下面的顺序操作。
 
-1. 启动慢 Worker。`./idlemesh worker --id slow --engine echo --echo-delay 2m`
+1. 启动慢 Worker。`./idlemesh worker --id slow --engine echo --echo-delay 2m --always-claim`
 2. 提交任务。`job=$(./idlemesh submit --engine echo --prompt '掉线后完成')`
 3. 用 `./idlemesh status "$job"` 确认任务进入 `running`，在慢 Worker 的终端按 Ctrl+C 停止它。
-4. 启动替补。`./idlemesh worker --id spare --engine echo`
+4. 启动替补。`./idlemesh worker --id spare --engine echo --always-claim`
 5. 在提交终端运行 `./idlemesh wait "$job"`。默认租约为 15 秒，轮询和重新执行也需要时间。最后会输出 `掉线后完成`。用原任务 ID 查询状态，应看到 `state` 为 `succeeded`、`worker_id` 为 `spare`、`attempt` 为 `2`。
 
-要验证协调器重启恢复，可先停止所有 Worker，提交一个回显任务，记住 ID。重启协调器时使用同一个 `--db` 路径，再启动回显 Worker。用原 ID 等待任务完成。
+要验证协调器重启恢复，可先停止所有 Worker，提交一个回显任务，记住 ID。重启协调器时使用同一个 `--db` 路径，再用 `--always-claim` 启动回显 Worker。用原 ID 等待任务完成。
 
 ## 从源码构建
 
