@@ -159,6 +159,21 @@ func (c *Client) Finish(ctx context.Context, id string, request FinishRequest) e
 	return err
 }
 
+func (c *Client) ChangeWorkerCredential(ctx context.Context, request WorkerCredentialChange) error {
+	key, err := randomIdempotencyKey()
+	if err != nil {
+		return err
+	}
+	status, err := c.do(ctx, http.MethodPost, "/v1/admin/worker-credentials", key, request, nil)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusNoContent {
+		return fmt.Errorf("worker credential change was not confirmed (HTTP %d)", status)
+	}
+	return nil
+}
+
 func workerJobPath(id string) string {
 	return "/v1/worker/jobs/" + url.PathEscape(id)
 }

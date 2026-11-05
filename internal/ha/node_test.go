@@ -5,7 +5,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -52,8 +55,15 @@ func TestThreeVotersFailoverAndRestore(t *testing.T) {
 	configs[0].Bootstrap = false
 
 	firstLeader := awaitLeader(t, nodes)
+	firstTerm := nodes[firstLeader].LeaderTerm()
+	if firstTerm == 0 {
+		t.Fatal("elected leader has no term")
+	}
 	for i, node := range nodes {
 		if i != firstLeader {
+			if term := node.LeaderTerm(); term != 0 {
+				t.Fatalf("follower reports leader term %d", term)
+			}
 			if _, err := node.Apply(t.Context(), []byte("must not apply")); !errors.Is(err, ErrUnavailable) {
 				t.Fatalf("follower accepted a write: %v", err)
 			}
@@ -65,6 +75,9 @@ func TestThreeVotersFailoverAndRestore(t *testing.T) {
 	}
 	stop(firstLeader)
 	newLeader := awaitLeader(t, nodes)
+	if term := nodes[newLeader].LeaderTerm(); term <= firstTerm {
+		t.Fatalf("replacement term = %d, want greater than %d", term, firstTerm)
+	}
 	applyCount(t, nodes[newLeader], "after failure", 2)
 
 	start(firstLeader)
@@ -154,6 +167,58 @@ func TestPeerAuthenticationAndStaticRoster(t *testing.T) {
 			node.Close()
 		}
 		t.Fatalf("bootstrapping existing state was accepted: %v", err)
+	}
+}
+
+func TestAuthenticationPolicyMigration(t *testing.T) {
+	configs := testCluster(t)
+	legacy := configs[0]
+	legacy.Listen = legacy.Peers[0].Address
+	stream, err := newPeerStream(legacy, legacy.Peers, legacy.Peers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.Close()
+	encoded, err := json.Marshal(legacy.Peers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(encoded)
+	if got, want := stream.clientTLS.NextProtos[0], "idlemesh-raft-v1-"+hex.EncodeToString(hash[:]); got != want {
+		t.Fatalf("legacy ALPN = %q, want v0.3 protocol %q", got, want)
+	}
+	var nodes [3]*Node
+	start := func() {
+		t.Helper()
+		for i, config := range configs {
+			node, err := Open(config, &raft.MockFSM{})
+			if err != nil {
+				t.Fatalf("open %s: %v", config.ID, err)
+			}
+			nodes[i] = node
+			t.Cleanup(func() { node.Close() })
+		}
+	}
+	start()
+	legacyLeader := awaitLeader(t, nodes)
+	applyCount(t, nodes[legacyLeader], "legacy state", 1)
+	for _, node := range nodes {
+		if err := node.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	configs[0].Bootstrap = false
+	configs[0].Policy = "managed-workers-v1"
+	configs[1].Policy = "managed-workers-v1"
+	start()
+	leader := awaitLeader(t, [3]*Node{nodes[0], nodes[1], nil})
+	applyCount(t, nodes[leader], "managed state", 2)
+	if err := nodes[1-leader].Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodes[leader].Barrier(t.Context()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a legacy voter formed a managed quorum: %v", err)
 	}
 }
 

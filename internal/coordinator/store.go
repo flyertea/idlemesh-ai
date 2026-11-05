@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -18,26 +19,56 @@ import (
 const maxActiveJobs = 1024
 
 var (
-	jobsBucket     = []byte("jobs-v1")
-	activeBucket   = []byte("active-v1")
-	submitKeys     = []byte("submit-keys-v1")
-	claimKeys      = []byte("claim-keys-v1")
-	errNotFound    = errors.New("job not found")
-	errStale       = errors.New("lease is expired or no longer current")
-	errQueueFull   = errors.New("queue is full")
-	errNoWork      = errors.New("no matching work")
-	errKeyConflict = errors.New("idempotency key was used with different input")
+	jobsBucket                 = []byte("jobs-v1")
+	activeBucket               = []byte("active-v1")
+	submitKeys                 = []byte("submit-keys-v1")
+	claimKeys                  = []byte("claim-keys-v1")
+	workerCredentials          = []byte("worker-credentials-v1")
+	workerDigests              = []byte("worker-digests-v1")
+	workerCredentialChangeKeys = []byte("worker-credential-change-keys-v1")
+	errNotFound                = errors.New("job not found")
+	errStale                   = errors.New("lease is expired or no longer current")
+	errQueueFull               = errors.New("queue is full")
+	errNoWork                  = errors.New("no matching work")
+	errKeyConflict             = errors.New("idempotency key was used with different input")
+	errWorkerUnauthorized      = errors.New("worker credential is invalid for this operation")
+	errWorkerDigestConflict    = errors.New("worker credential digest is already reserved")
+	errInvalidWorkerCredential = errors.New("invalid worker credential change")
 )
 
+// v0.3 snapshots contain the base buckets. Credential buckets are added on restore.
 var stateBuckets = [][]byte{jobsBucket, activeBucket, submitKeys, claimKeys}
+var credentialBuckets = [][]byte{workerCredentials, workerDigests, workerCredentialChangeKeys}
+
+func ensureCredentialBuckets(tx *bolt.Tx) error {
+	present := 0
+	for _, bucket := range credentialBuckets {
+		if tx.Bucket(bucket) != nil {
+			present++
+		}
+	}
+	if present == len(credentialBuckets) {
+		return nil
+	}
+	if present != 0 {
+		return errors.New("incomplete worker credential state")
+	}
+	for _, bucket := range credentialBuckets {
+		if _, err := tx.CreateBucket(bucket); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 type record struct {
 	api.Job
-	Prompt       string    `json:"prompt,omitempty"`
-	MaxTokens    int       `json:"max_tokens"`
-	Token        string    `json:"token,omitempty"`
-	LastFinished string    `json:"last_finished,omitempty"`
-	DueAt        time.Time `json:"due_at"`
+	Prompt             string    `json:"prompt,omitempty"`
+	MaxTokens          int       `json:"max_tokens"`
+	Token              string    `json:"token,omitempty"`
+	LastFinished       string    `json:"last_finished,omitempty"`
+	LastFinishedWorker string    `json:"last_finished_worker,omitempty"`
+	DueAt              time.Time `json:"due_at"`
 }
 
 type store struct {
@@ -57,7 +88,7 @@ func openStore(path string, leaseTime time.Duration, maxAttempts int) (*store, e
 				return err
 			}
 		}
-		return nil
+		return ensureCredentialBuckets(tx)
 	})
 	if err != nil {
 		db.Close()
@@ -159,12 +190,16 @@ func (s *store) claim(req api.ClaimRequest) (*api.Lease, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.claimAt(req, "", token, time.Now().UTC(), s.leaseTime)
+	return s.claimAt(req, "", token, "", time.Now().UTC(), s.leaseTime)
 }
 
-func (s *store) claimAt(req api.ClaimRequest, requestKey, token string, now time.Time, leaseTime time.Duration) (*api.Lease, error) {
+func (s *store) claimAt(req api.ClaimRequest, requestKey, token, workerDigest string, now time.Time, leaseTime time.Duration) (*api.Lease, error) {
 	var lease *api.Lease
 	err := s.db.Update(func(tx *bolt.Tx) error {
+		workerID, err := credentialOwner(tx, workerDigest)
+		if err != nil || (workerID != "" && workerID != req.WorkerID) {
+			return errWorkerUnauthorized
+		}
 		keys := tx.Bucket(claimKeys)
 		if requestKey != "" {
 			if value := keys.Get([]byte(requestKey)); value != nil {
@@ -228,19 +263,26 @@ func (r record) lease(now time.Time) *api.Lease {
 }
 
 func (s *store) renew(id, token string) (*api.Lease, error) {
-	return s.renewAt(id, token, time.Now().UTC(), s.leaseTime)
+	return s.renewAt(id, token, "", time.Now().UTC(), s.leaseTime)
 }
 
-func (s *store) renewAt(id, token string, now time.Time, leaseTime time.Duration) (*api.Lease, error) {
-	key, err := jobKey(id)
-	if err != nil {
-		return nil, err
-	}
+func (s *store) renewAt(id, token, workerDigest string, now time.Time, leaseTime time.Duration) (*api.Lease, error) {
 	var ttl time.Duration
-	err = s.db.Update(func(tx *bolt.Tx) error {
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		workerID, err := credentialOwner(tx, workerDigest)
+		if err != nil {
+			return err
+		}
+		key, err := jobKey(id)
+		if err != nil {
+			return err
+		}
 		r, err := load(tx, key)
 		if err != nil {
 			return err
+		}
+		if workerID != "" && workerID != r.WorkerID {
+			return errWorkerUnauthorized
 		}
 		if !r.validLease(token, now) {
 			return errStale
@@ -256,26 +298,37 @@ func (s *store) renewAt(id, token string, now time.Time, leaseTime time.Duration
 }
 
 func (s *store) finish(id string, req api.FinishRequest) error {
-	return s.finishAt(id, req, time.Now().UTC())
+	return s.finishAt(id, req, "", time.Now().UTC())
 }
 
-func (s *store) finishAt(id string, req api.FinishRequest, now time.Time) error {
-	key, err := jobKey(id)
-	if err != nil {
-		return err
-	}
+func (s *store) finishAt(id string, req api.FinishRequest, workerDigest string, now time.Time) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
+		workerID, err := credentialOwner(tx, workerDigest)
+		if err != nil {
+			return err
+		}
+		key, err := jobKey(id)
+		if err != nil {
+			return err
+		}
 		r, err := load(tx, key)
 		if err != nil {
 			return err
 		}
 		if equalToken(r.LastFinished, req.Token) {
+			if workerID != "" && workerID != r.LastFinishedWorker {
+				return errWorkerUnauthorized
+			}
 			return nil
+		}
+		if workerID != "" && workerID != r.WorkerID {
+			return errWorkerUnauthorized
 		}
 		if !r.validLease(req.Token, now) {
 			return errStale
 		}
 		r.LastFinished = r.Token
+		r.LastFinishedWorker = r.WorkerID
 		r.Token = ""
 		r.UpdatedAt = maxTime(r.UpdatedAt, now)
 		if req.Error == "" {
@@ -325,25 +378,129 @@ func (s *store) reapAt(now time.Time) error {
 				return err
 			}
 			if r.expired(now) {
-				r.Error = "worker lease expired before a result was received"
-				r.UpdatedAt = maxTime(r.UpdatedAt, now)
-				if r.Attempt >= r.MaxAttempts {
-					r.State = api.Failed
-					if err := terminal(tx, key, r); err != nil {
-						return err
-					}
-					continue
-				}
-				r.State = api.Queued
-				r.Token = ""
-				r.DueAt = time.Time{}
-				if err := put(tx, key, r); err != nil {
+				if err := stopRunningLease(tx, key, r, now, "worker lease expired before a result was received"); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	})
+}
+
+func stopRunningLease(tx *bolt.Tx, key []byte, r record, now time.Time, reason string) error {
+	r.Error = reason
+	r.UpdatedAt = maxTime(r.UpdatedAt, now)
+	if r.Attempt >= r.MaxAttempts {
+		r.State = api.Failed
+		return terminal(tx, key, r)
+	}
+	r.State = api.Queued
+	r.Token = ""
+	r.DueAt = time.Time{}
+	return put(tx, key, r)
+}
+
+func validateWorkerCredentialChange(req api.WorkerCredentialChange) error {
+	if !api.ValidWorkerID(req.WorkerID) {
+		return errInvalidWorkerCredential
+	}
+	if req.Digest != "" && !api.ValidWorkerCredentialDigest(req.Digest) {
+		return errInvalidWorkerCredential
+	}
+	return nil
+}
+
+// credentialOwner must be called inside the lease operation's transaction so a
+// committed rotation or revocation can never race authorization.
+func credentialOwner(tx *bolt.Tx, digest string) (string, error) {
+	if digest == "" {
+		return "", nil // Legacy authentication was checked by the HTTP handler.
+	}
+	owner := tx.Bucket(workerDigests).Get([]byte(digest))
+	if owner == nil || string(tx.Bucket(workerCredentials).Get(owner)) != digest {
+		return "", errWorkerUnauthorized
+	}
+	return string(owner), nil
+}
+
+func (s *store) changeWorkerCredentialAt(req api.WorkerCredentialChange, requestKey string, now time.Time) error {
+	if err := validateWorkerCredentialChange(req); err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		receipts := tx.Bucket(workerCredentialChangeKeys)
+		if requestKey != "" {
+			if value := receipts.Get([]byte(requestKey)); value != nil {
+				var saved api.WorkerCredentialChange
+				if err := json.Unmarshal(value, &saved); err != nil {
+					return err
+				}
+				if saved != req {
+					return errKeyConflict
+				}
+				return nil
+			}
+		}
+		credentials := tx.Bucket(workerCredentials)
+		id := []byte(req.WorkerID)
+		previous := string(credentials.Get(id))
+		if req.Digest != previous {
+			if req.Digest == "" {
+				if err := credentials.Delete(id); err != nil {
+					return err
+				}
+			} else {
+				digests := tx.Bucket(workerDigests)
+				digest := []byte(req.Digest)
+				// Reserve every issued digest, including retired ones, so an old
+				// copy of a credential can never be made usable again.
+				if digests.Get(digest) != nil {
+					return errWorkerDigestConflict
+				}
+				if err := digests.Put(digest, id); err != nil {
+					return err
+				}
+				if err := credentials.Put(id, digest); err != nil {
+					return err
+				}
+			}
+			if previous != "" {
+				if err := fenceWorkerLeases(tx, req.WorkerID, now); err != nil {
+					return err
+				}
+			}
+		}
+		if requestKey != "" {
+			return putJSON(receipts, []byte(requestKey), req)
+		}
+		return nil
+	})
+}
+
+func fenceWorkerLeases(tx *bolt.Tx, workerID string, now time.Time) error {
+	var keys [][]byte
+	if err := tx.Bucket(activeBucket).ForEach(func(key, _ []byte) error {
+		r, err := load(tx, key)
+		if err != nil {
+			return fmt.Errorf("read active job while fencing worker leases: %w", err)
+		}
+		if r.State == api.Running && r.WorkerID == workerID {
+			keys = append(keys, append([]byte(nil), key...))
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		r, err := load(tx, key)
+		if err != nil {
+			return fmt.Errorf("read worker lease to fence: %w", err)
+		}
+		if err := stopRunningLease(tx, key, r, now, "worker credential changed during execution"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r record) expired(now time.Time) bool {

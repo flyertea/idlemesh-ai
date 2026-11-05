@@ -4,7 +4,7 @@
 
 ## 本机演练
 
-解压 v0.3，把 `idlemesh` 二进制放在新的演练目录。以下证书命令使用 Bash 和 OpenSSL 3。Windows 可以在另一台可信主机签发证书和令牌，再使用后文的 PowerShell 命令启动。演练所有端口都绑定到 `127.0.0.1`。在开始前确认这些端口可用。
+解压 v0.4，把 `idlemesh` 二进制放在新的演练目录。以下演练使用默认的共享 Worker 令牌模式，证书命令使用 Bash 和 OpenSSL 3。Windows 可以在另一台可信主机签发证书和令牌，再使用后文的 PowerShell 命令启动。演练所有端口都绑定到 `127.0.0.1`。在开始前确认这些端口可用。
 
 | 节点 ID | API 地址 | Raft 地址 | 状态目录 |
 | --- | --- | --- | --- |
@@ -150,3 +150,21 @@ $job = .\idlemesh.exe submit @servers --request-id $requestKey --engine echo --p
 每台主机都保留自己的 `--raft-dir`。将目录和备份按敏感数据保护。维护期间逐台重启并确认 `/readyz` 可以从集群中的某台获得 `200`。丢失多数派时，优先恢复原节点、原目录和互通网络。固定成员名单应保持不变。
 
 从单协调器迁移时，先停止往旧队列提交任务，等待队列处理完并保留旧 `--db` 文件。新集群从独立的队列开始。需要查旧任务时，仍通过原数据库启动单机协调器并在原入口查询。
+
+## 启用独立 Worker 凭据
+
+三个协调器都须运行 v0.4 并使用同一种凭据模式。托管模式与共享令牌模式的 Raft 节点彼此隔离。切换现有集群时，安排一次维护窗口，停止所有旧协调器后再启动新配置，避免运行中混用两种模式。
+
+1. 为三个协调器配置相同的 `IDLEMESH_CLIENT_TOKEN` 和 `IDLEMESH_ADMIN_TOKEN`。两种令牌须不同。移除各协调器环境中的 `IDLEMESH_WORKER_TOKEN`。Bash 使用 `unset IDLEMESH_WORKER_TOKEN`，PowerShell 使用 `Remove-Item Env:IDLEMESH_WORKER_TOKEN`。
+2. 在各协调器原启动命令加上 `--managed-workers`。沿用每个节点原有的 `--raft-dir`、ID、固定成员地址和证书。已有集群的启动命令省略 `--raft-bootstrap`。
+3. 等待多数派恢复，用客户端令牌查询 `/readyz`。在管理员终端设置 `IDLEMESH_ADMIN_TOKEN`，为每个 Worker ID 分别发放令牌。Worker 使用新令牌重启，保留自己的 ID。原共享令牌在托管模式下失效。
+
+用集群的三个 API 地址发放或撤销 `cpu-a`。三个协调器的 API 证书须受管理员终端信任。
+
+```bash
+servers=(--server https://mesh-a.example.net:8787 --server https://mesh-b.example.net:8787 --server https://mesh-c.example.net:8787)
+./idlemesh worker-token issue --id cpu-a "${servers[@]}"
+./idlemesh worker-token revoke --id cpu-a "${servers[@]}"
+```
+
+发放操作只在确认成功后输出一次令牌。发放因超时而未取得令牌时，可以再次为同一个 ID 发放，新的凭据会替代此前可能已生效的凭据。撤销成功后，旧 Worker 无法领取任务、续租或提交结果。多数派会保存撤销状态，领导者切换后也生效。 [凭据与角色说明](../README.md#为每台-worker-单独发放凭据)

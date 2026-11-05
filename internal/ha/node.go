@@ -37,6 +37,7 @@ type Config struct {
 	DataDir   string
 	Peers     []Peer // all three voters, including the local node
 	Bootstrap bool   // use only on the first startup of the lexically first ID
+	Policy    string // optional compatibility mode, negotiated only on the wire
 	TLSCert   string
 	TLSKey    string
 	TLSCA     string
@@ -173,6 +174,16 @@ func Open(cfg Config, fsm raft.FSM) (*Node, error) {
 
 // IsLeader is a routing hint. Apply and Barrier enforce quorum separately.
 func (n *Node) IsLeader() bool { return n.raft.State() == raft.Leader }
+
+// LeaderTerm observes the term while this voter is the leader, or returns zero.
+// Apply and Barrier enforce quorum separately.
+func (n *Node) LeaderTerm() uint64 {
+	term := n.raft.CurrentTerm()
+	if !n.IsLeader() || n.raft.CurrentTerm() != term {
+		return 0
+	}
+	return term
+}
 
 // LeaderID is the last known leader, or the empty string during an election.
 func (n *Node) LeaderID() string {

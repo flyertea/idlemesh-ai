@@ -6,23 +6,27 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/flyertea/idlemesh-ai/internal/api"
 	"github.com/flyertea/idlemesh-ai/internal/ha"
+	bolt "go.etcd.io/bbolt"
 )
 
 type operation struct {
-	Kind        string            `json:"kind"`
-	At          time.Time         `json:"at"`
-	ID          string            `json:"id,omitempty"`
-	Token       string            `json:"token,omitempty"`
-	Key         string            `json:"key,omitempty"`
-	LeaseTime   time.Duration     `json:"lease_time,omitempty"`
-	MaxAttempts int               `json:"max_attempts,omitempty"`
-	Submit      api.SubmitRequest `json:"submit,omitempty"`
-	Claim       api.ClaimRequest  `json:"claim,omitempty"`
-	Finish      api.FinishRequest `json:"finish,omitempty"`
+	Kind         string                      `json:"kind"`
+	At           time.Time                   `json:"at"`
+	ID           string                      `json:"id,omitempty"`
+	Token        string                      `json:"token,omitempty"`
+	Key          string                      `json:"key,omitempty"`
+	LeaseTime    time.Duration               `json:"lease_time,omitempty"`
+	MaxAttempts  int                         `json:"max_attempts,omitempty"`
+	Submit       api.SubmitRequest           `json:"submit,omitempty"`
+	Claim        api.ClaimRequest            `json:"claim,omitempty"`
+	Finish       api.FinishRequest           `json:"finish,omitempty"`
+	WorkerDigest string                      `json:"worker_digest,omitempty"`
+	Credential   *api.WorkerCredentialChange `json:"credential,omitempty"`
 }
 
 type applied struct {
@@ -32,10 +36,12 @@ type applied struct {
 }
 
 type cluster struct {
-	node        *ha.Node
-	view        *projection
-	leaseTime   time.Duration
-	maxAttempts int
+	node            *ha.Node
+	view            *projection
+	leaseTime       time.Duration
+	maxAttempts     int
+	managedWorkers  bool
+	readyWorkerTerm atomic.Uint64
 }
 
 func openCluster(config ha.Config, leaseTime time.Duration, maxAttempts int) (*cluster, error) {
@@ -50,7 +56,7 @@ func openCluster(config ha.Config, leaseTime time.Duration, maxAttempts int) (*c
 		view.close()
 		return nil, err
 	}
-	return &cluster{node: node, view: view, leaseTime: leaseTime, maxAttempts: maxAttempts}, nil
+	return &cluster{node: node, view: view, leaseTime: leaseTime, maxAttempts: maxAttempts, managedWorkers: config.Policy != ""}, nil
 }
 
 func (c *cluster) close() error {
@@ -74,30 +80,61 @@ func (c *cluster) Status(ctx context.Context, id string) (api.Job, error) {
 	return c.view.store.status(id)
 }
 
-func (c *cluster) Claim(ctx context.Context, req api.ClaimRequest, key string) (*api.Lease, error) {
+func (c *cluster) Claim(ctx context.Context, req api.ClaimRequest, key, workerDigest string) (*api.Lease, error) {
+	if err := c.checkWorkerCredential(workerDigest, req.WorkerID); err != nil {
+		return nil, err
+	}
 	token, err := newLeaseToken()
 	if err != nil {
 		return nil, err
 	}
-	result := c.apply(ctx, operation{Kind: "claim", Claim: req, Key: key, Token: token, LeaseTime: c.leaseTime})
+	result := c.apply(ctx, operation{Kind: "claim", Claim: req, Key: key, Token: token, WorkerDigest: workerDigest, LeaseTime: c.leaseTime})
 	return result.lease, result.err
 }
 
-func (c *cluster) Renew(ctx context.Context, id, token string) (*api.Lease, error) {
-	result := c.apply(ctx, operation{Kind: "renew", ID: id, Token: token, LeaseTime: c.leaseTime})
+func (c *cluster) Renew(ctx context.Context, id, token, workerDigest string) (*api.Lease, error) {
+	if err := c.checkWorkerCredential(workerDigest, ""); err != nil {
+		return nil, err
+	}
+	result := c.apply(ctx, operation{Kind: "renew", ID: id, Token: token, WorkerDigest: workerDigest, LeaseTime: c.leaseTime})
 	if result.err == nil && result.lease == nil {
 		return nil, errStale
 	}
 	return result.lease, result.err
 }
 
-func (c *cluster) Finish(ctx context.Context, id string, req api.FinishRequest) error {
-	return c.apply(ctx, operation{Kind: "finish", ID: id, Finish: req}).err
+func (c *cluster) Finish(ctx context.Context, id string, req api.FinishRequest, workerDigest string) error {
+	if err := c.checkWorkerCredential(workerDigest, ""); err != nil {
+		return err
+	}
+	return c.apply(ctx, operation{Kind: "finish", ID: id, Finish: req, WorkerDigest: workerDigest}).err
+}
+
+func (c *cluster) ChangeWorkerCredential(ctx context.Context, req api.WorkerCredentialChange, key string) error {
+	if err := validateWorkerCredentialChange(req); err != nil {
+		return err
+	}
+	term := c.node.LeaderTerm()
+	err := c.apply(ctx, operation{Kind: "worker_credential", Key: key, Credential: &req}).err
+	if err == nil && term != 0 && c.node.LeaderTerm() == term {
+		c.markWorkerTermReady(term)
+	}
+	return err
 }
 
 func (c *cluster) Reap(ctx context.Context) error {
-	if !c.node.IsLeader() {
+	term := c.node.LeaderTerm()
+	if term == 0 {
 		return nil
+	}
+	if c.managedWorkers && c.readyWorkerTerm.Load() != term {
+		if err := c.Ready(ctx); err != nil {
+			return err
+		}
+		if c.node.LeaderTerm() != term {
+			return ha.ErrUnavailable
+		}
+		c.markWorkerTermReady(term)
 	}
 	c.view.mu.RLock()
 	expired, err := c.view.store.expiredJobs(time.Now().UTC())
@@ -106,6 +143,45 @@ func (c *cluster) Reap(ctx context.Context) error {
 		return err
 	}
 	return c.apply(ctx, operation{Kind: "reap"}).err
+}
+
+func (c *cluster) markWorkerTermReady(term uint64) {
+	for previous := c.readyWorkerTerm.Load(); previous < term; previous = c.readyWorkerTerm.Load() {
+		if c.readyWorkerTerm.CompareAndSwap(previous, term) {
+			return
+		}
+	}
+}
+
+// Reject unknown credentials without appending a Raft entry. This check is
+// advisory: the FSM checks the credential again in the mutation transaction.
+func (c *cluster) checkWorkerCredential(digest, workerID string) error {
+	if digest == "" {
+		return nil
+	}
+	if !api.ValidWorkerCredentialDigest(digest) {
+		return errWorkerUnauthorized
+	}
+	term := c.node.LeaderTerm()
+	if term == 0 || c.readyWorkerTerm.Load() != term {
+		return ha.ErrUnavailable
+	}
+	c.view.mu.RLock()
+	defer c.view.mu.RUnlock()
+	if c.view.store == nil {
+		return ha.ErrUnavailable
+	}
+	err := c.view.store.db.View(func(tx *bolt.Tx) error {
+		owner, err := credentialOwner(tx, digest)
+		if err == nil && workerID != "" && workerID != owner {
+			return errWorkerUnauthorized
+		}
+		return err
+	})
+	if c.node.LeaderTerm() != term {
+		return ha.ErrUnavailable
+	}
+	return err
 }
 
 func (c *cluster) Ready(ctx context.Context) error {

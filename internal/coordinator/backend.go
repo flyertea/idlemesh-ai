@@ -10,9 +10,10 @@ import (
 type backend interface {
 	Submit(context.Context, api.SubmitRequest, string) (api.Job, error)
 	Status(context.Context, string) (api.Job, error)
-	Claim(context.Context, api.ClaimRequest, string) (*api.Lease, error)
-	Renew(context.Context, string, string) (*api.Lease, error)
-	Finish(context.Context, string, api.FinishRequest) error
+	Claim(ctx context.Context, req api.ClaimRequest, key, workerDigest string) (*api.Lease, error)
+	Renew(ctx context.Context, id, token, workerDigest string) (*api.Lease, error)
+	Finish(ctx context.Context, id string, req api.FinishRequest, workerDigest string) error
+	ChangeWorkerCredential(ctx context.Context, req api.WorkerCredentialChange, key string) error
 	Reap(context.Context) error
 	Ready(context.Context) error
 }
@@ -25,20 +26,24 @@ func (s *store) Status(_ context.Context, id string) (api.Job, error) {
 	return s.status(id)
 }
 
-func (s *store) Claim(_ context.Context, req api.ClaimRequest, key string) (*api.Lease, error) {
+func (s *store) Claim(_ context.Context, req api.ClaimRequest, key, workerDigest string) (*api.Lease, error) {
 	token, err := newLeaseToken()
 	if err != nil {
 		return nil, err
 	}
-	return s.claimAt(req, key, token, time.Now().UTC(), s.leaseTime)
+	return s.claimAt(req, key, token, workerDigest, time.Now().UTC(), s.leaseTime)
 }
 
-func (s *store) Renew(_ context.Context, id, token string) (*api.Lease, error) {
-	return s.renew(id, token)
+func (s *store) Renew(_ context.Context, id, token, workerDigest string) (*api.Lease, error) {
+	return s.renewAt(id, token, workerDigest, time.Now().UTC(), s.leaseTime)
 }
 
-func (s *store) Finish(_ context.Context, id string, req api.FinishRequest) error {
-	return s.finish(id, req)
+func (s *store) Finish(_ context.Context, id string, req api.FinishRequest, workerDigest string) error {
+	return s.finishAt(id, req, workerDigest, time.Now().UTC())
+}
+
+func (s *store) ChangeWorkerCredential(_ context.Context, req api.WorkerCredentialChange, key string) error {
+	return s.changeWorkerCredentialAt(req, key, time.Now().UTC())
 }
 
 func (s *store) Reap(_ context.Context) error {

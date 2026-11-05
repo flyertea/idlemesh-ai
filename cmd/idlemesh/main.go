@@ -27,6 +27,7 @@ const (
 	defaultServer = "http://" + defaultListen
 	clientToken   = "IDLEMESH_CLIENT_TOKEN"
 	workerToken   = "IDLEMESH_WORKER_TOKEN"
+	adminToken    = "IDLEMESH_ADMIN_TOKEN"
 )
 
 var version = "dev"
@@ -60,6 +61,8 @@ func run(ctx context.Context, args []string) error {
 		return runCoordinator(ctx, args[1:])
 	case "worker":
 		return runWorker(ctx, args[1:])
+	case "worker-token":
+		return manageWorkerToken(ctx, args[1:])
 	case "submit":
 		return submit(ctx, args[1:])
 	case "status":
@@ -76,6 +79,7 @@ func usage(w io.Writer) {
 
   coordinator   Serve a durable inference queue
   worker        Pull jobs and run local inference
+  worker-token  Issue or revoke an individual worker credential
   submit        Submit a prompt and print its job ID
   status        Print a job's status as JSON
   wait          Wait for a job and print its final output
@@ -94,6 +98,7 @@ func runCoordinator(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.TLSCert, "tls-cert", "", "PEM TLS certificate file")
 	fs.StringVar(&cfg.TLSKey, "tls-key", "", "PEM TLS private key file")
 	fs.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", false, "allow plaintext on a private encrypted network")
+	fs.BoolVar(&cfg.ManagedWorkers, "managed-workers", false, "require individual worker credentials instead of a shared token")
 	raftConfig := addRaftFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -118,6 +123,7 @@ func runCoordinator(ctx context.Context, args []string) error {
 	}
 	cfg.ClientToken = os.Getenv(clientToken)
 	cfg.WorkerToken = os.Getenv(workerToken)
+	cfg.AdminToken = os.Getenv(adminToken)
 	cfg.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	return coordinator.Run(ctx, cfg)
 }

@@ -129,6 +129,12 @@ func newPeerStream(cfg Config, peers []Peer, local Peer) (*peerStream, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.Policy != "" {
+		// JSON never contains a literal NUL, so the roster and policy are
+		// unambiguous. The empty policy keeps the original v0.3 wire format.
+		roster = append(roster, 0)
+		roster = append(roster, cfg.Policy...)
+	}
 	digest := sha256.Sum256(roster)
 	protocol := rosterProtoBase + hex.EncodeToString(digest[:])
 	baseTLS := &tls.Config{
@@ -143,7 +149,7 @@ func newPeerStream(cfg Config, peers []Peer, local Peer) (*peerStream, error) {
 	serverTLS.ClientAuth = tls.RequireAndVerifyClientCert
 	serverTLS.VerifyConnection = func(state tls.ConnectionState) error {
 		if state.NegotiatedProtocol != protocol {
-			return errors.New("Raft peer roster does not match")
+			return errors.New("Raft peer roster or policy does not match")
 		}
 		if len(state.PeerCertificates) != 0 {
 			for _, peer := range peers {
@@ -230,7 +236,7 @@ func (s *peerStream) Dial(address raft.ServerAddress, timeout time.Duration) (ne
 	config.ServerName, _, _ = net.SplitHostPort(peer.Address)
 	config.VerifyConnection = func(state tls.ConnectionState) error {
 		if state.NegotiatedProtocol != config.NextProtos[0] {
-			return errors.New("Raft peer roster does not match")
+			return errors.New("Raft peer roster or policy does not match")
 		}
 		return verifyPeerCert(state.PeerCertificates[0], peer)
 	}

@@ -6,7 +6,7 @@
 
 ## 下载
 
-下载并解压与操作系统、处理器对应的 ZIP。`amd64` 适用于 Intel 和 AMD 的 64 位处理器，`arm64` 适用于 Apple 芯片及其他 64 位 ARM 处理器。压缩包名例如 `idlemesh-v0.3.0-darwin-arm64.zip`。可以用发布页的 `SHA256SUMS` 核对下载。 [GitHub Releases](https://github.com/flyertea/idlemesh-ai/releases)
+下载并解压与操作系统、处理器对应的 ZIP。`amd64` 适用于 Intel 和 AMD 的 64 位处理器，`arm64` 适用于 Apple 芯片及其他 64 位 ARM 处理器。压缩包名例如 `idlemesh-v0.4.0-darwin-arm64.zip`。可以用发布页的 `SHA256SUMS` 核对下载。 [GitHub Releases](https://github.com/flyertea/idlemesh-ai/releases)
 
 ## 五分钟跑通
 
@@ -87,7 +87,7 @@ Windows 使用 `.\idlemesh.exe` 并用 `$job =` 接收任务 ID。Worker 请求�
 
 ## 让其他电脑加入
 
-以下单协调器示例在一台常开的电脑上监听私有地址。把 `192.168.1.50` 和 `mesh.example.net` 换成你的协调器地址及名称，并使用客户端系统信任、且匹配该名称的 TLS 证书。只向参与设备开放协调器端口。协调器需要两个不同的随机令牌。在启动进程的终端设置环境变量，分别将客户端令牌交给提交端、将 Worker 令牌交给参与运算的电脑。
+以下单协调器示例使用默认的共享 Worker 令牌模式，在一台常开的电脑上监听私有地址。把 `192.168.1.50` 和 `mesh.example.net` 换成你的协调器地址及名称，并使用客户端系统信任、且匹配该名称的 TLS 证书。只向参与设备开放协调器端口。协调器需要两个不同的随机令牌。在启动进程的终端设置环境变量，分别将客户端令牌交给提交端、将 Worker 令牌交给参与运算的电脑。
 
 | 进程 | 需要设置的环境变量 |
 | --- | --- |
@@ -117,6 +117,35 @@ v0.3 支持三个固定的 Raft 投票节点。把它们放在三台独立且时
 
 从单机切换到集群时，先让旧队列处理完并保留原 `--db` 文件，随后将客户端和 Worker 指向新集群。新集群使用独立的任务队列和任务 ID，旧任务可以通过原来的单机协调器查询。
 
+## 为每台 Worker 单独发放凭据
+
+v0.4 可以给每个 Worker ID 发放独立令牌。一台电脑退出或令牌泄露时，可以单独撤销它。单协调器与三协调器集群均可选用，默认仍使用共享 Worker 令牌。
+
+| 进程 | 托管模式需要设置的环境变量 |
+| --- | --- |
+| 协调器 | 两个不同的随机值 `IDLEMESH_CLIENT_TOKEN` 和 `IDLEMESH_ADMIN_TOKEN` |
+| 管理员终端 | `IDLEMESH_ADMIN_TOKEN` |
+| Worker | 为该 `--id` 发放的 `IDLEMESH_WORKER_TOKEN` |
+| 提交、查询和等待结果 | `IDLEMESH_CLIENT_TOKEN` |
+
+协调器启用 `--managed-workers`，并从协调器的环境中移除共享的 `IDLEMESH_WORKER_TOKEN`。管理员令牌只交给负责签发凭据的人员。以下示例使用本机默认 API 地址，分别在配置好对应令牌的终端运行。PowerShell 使用 `.\idlemesh.exe`，用 `Remove-Item Env:IDLEMESH_WORKER_TOKEN` 移除已有的共享令牌。
+
+```sh
+# 协调器终端
+unset IDLEMESH_WORKER_TOKEN
+./idlemesh coordinator --managed-workers
+
+# 管理员终端
+./idlemesh worker-token issue --id worker-a
+
+# Worker 终端，先把上一步发放的令牌设为 IDLEMESH_WORKER_TOKEN
+./idlemesh worker --id worker-a --engine echo --always-claim
+```
+
+`issue` 仅在协调器确认后输出新令牌。保存并通过私密渠道交给对应 Worker，启动时使用同一个 `--id`。对同一 ID 再次运行 `issue` 会换发令牌。运行 `./idlemesh worker-token revoke --id worker-a` 撤销，成功时无输出。换发或撤销会立即使旧令牌和旧租约失效。仍有重试次数的任务会重新进入队列，由有权限的 Worker 接手。
+
+对于远程部署，管理员命令也用 `--server` 指定 API 地址，三节点部署可重复传入。现有集群切换模式时需要停机升级，沿用三个原状态目录。 [托管凭据的集群切换步骤](docs/ha-setup.md#启用独立-worker-凭据)
+
 ## 手动验证掉线恢复
 
 在同一电脑开多个终端也能验证调度。保持默认协调器运行，关闭之前的回显 Worker，然后按下面的顺序操作。
@@ -138,6 +167,6 @@ go test ./...
 go build -o idlemesh ./cmd/idlemesh
 ```
 
-各命令的选项可通过 `idlemesh coordinator --help`、`idlemesh worker --help`、`idlemesh submit --help`、`idlemesh status --help` 和 `idlemesh wait --help` 查看。
+各命令的选项可通过 `idlemesh coordinator --help`、`idlemesh worker --help`、`idlemesh worker-token issue --help`、`idlemesh submit --help`、`idlemesh status --help` 和 `idlemesh wait --help` 查看。
 
 欢迎通过 GitHub Issues 提交故障复现和跨平台实测结果。项目采用 [Apache 2.0 许可证](LICENSE)，模型及推理运行时分别适用各自的许可。

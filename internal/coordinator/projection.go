@@ -74,13 +74,13 @@ func (p *projection) build(snapshot io.Reader) (*store, string, error) {
 		var db *bolt.DB
 		db, err = bolt.Open(path, 0600, nil)
 		if err == nil {
-			err = db.View(func(tx *bolt.Tx) error {
+			err = db.Update(func(tx *bolt.Tx) error {
 				for _, bucket := range stateBuckets {
 					if tx.Bucket(bucket) == nil {
 						return fmt.Errorf("coordinator snapshot is missing bucket %q", bucket)
 					}
 				}
-				return nil
+				return ensureCredentialBuckets(tx)
 			})
 			if err != nil {
 				db.Close()
@@ -112,18 +112,24 @@ func (p *projection) Apply(log *raft.Log) any {
 	case "submit":
 		result.job, result.err = s.submitAt(op.Submit, op.Key, op.At, op.MaxAttempts)
 	case "claim":
-		result.lease, result.err = s.claimAt(op.Claim, op.Key, op.Token, op.At, op.LeaseTime)
+		result.lease, result.err = s.claimAt(op.Claim, op.Key, op.Token, op.WorkerDigest, op.At, op.LeaseTime)
 	case "renew":
-		result.lease, result.err = s.renewAt(op.ID, op.Token, op.At, op.LeaseTime)
+		result.lease, result.err = s.renewAt(op.ID, op.Token, op.WorkerDigest, op.At, op.LeaseTime)
 	case "finish":
-		result.err = s.finishAt(op.ID, op.Finish, op.At)
+		result.err = s.finishAt(op.ID, op.Finish, op.WorkerDigest, op.At)
+	case "worker_credential":
+		if op.Credential == nil {
+			panic("committed credential operation has no credential change")
+		}
+		result.err = s.changeWorkerCredentialAt(*op.Credential, op.Key, op.At)
 	case "reap":
 		result.err = s.reapAt(op.At)
 	default:
 		panic(fmt.Errorf("unknown committed coordinator operation %q", op.Kind))
 	}
 	switch result.err {
-	case nil, errNotFound, errStale, errQueueFull, errKeyConflict:
+	case nil, errNotFound, errStale, errQueueFull, errKeyConflict, errWorkerUnauthorized,
+		errWorkerDigestConflict, errInvalidWorkerCredential:
 		return result
 	default:
 		// Raft has committed this operation. A local storage failure must

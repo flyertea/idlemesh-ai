@@ -28,6 +28,8 @@ type Config struct {
 	TLSKey            string
 	ClientToken       string
 	WorkerToken       string
+	AdminToken        string
+	ManagedWorkers    bool
 	AllowInsecureHTTP bool
 	Logger            *log.Logger
 	Raft              *ha.Config
@@ -52,11 +54,8 @@ func Run(ctx context.Context, cfg Config) error {
 	if remote && !tls && !cfg.AllowInsecureHTTP {
 		return errors.New("non-loopback listening requires TLS or --allow-insecure-http")
 	}
-	if remote || cfg.ClientToken != "" || cfg.WorkerToken != "" {
-		if !validAuthToken(cfg.ClientToken) || !validAuthToken(cfg.WorkerToken) ||
-			cfg.ClientToken == cfg.WorkerToken {
-			return errors.New("set distinct IDLEMESH_CLIENT_TOKEN and IDLEMESH_WORKER_TOKEN values (32–256 printable ASCII characters each, without spaces)")
-		}
+	if err := validateAuthentication(cfg, remote); err != nil {
+		return err
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
@@ -71,7 +70,11 @@ func Run(ctx context.Context, cfg Config) error {
 		defer local.db.Close()
 		db = local
 	} else {
-		replicated, err := openCluster(*cfg.Raft, cfg.LeaseTime, cfg.MaxAttempts)
+		raftConfig := *cfg.Raft
+		if cfg.ManagedWorkers {
+			raftConfig.Policy = "managed-workers-v1"
+		}
+		replicated, err := openCluster(raftConfig, cfg.LeaseTime, cfg.MaxAttempts)
 		if err != nil {
 			return fmt.Errorf("open coordinator Raft cluster: %w", err)
 		}
@@ -133,6 +136,24 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+func validateAuthentication(cfg Config, remote bool) error {
+	if cfg.ManagedWorkers {
+		if cfg.WorkerToken != "" {
+			return errors.New("unset IDLEMESH_WORKER_TOKEN on a coordinator using --managed-workers")
+		}
+		if !validAuthToken(cfg.ClientToken) || !validAuthToken(cfg.AdminToken) || cfg.ClientToken == cfg.AdminToken {
+			return errors.New("set distinct IDLEMESH_CLIENT_TOKEN and IDLEMESH_ADMIN_TOKEN values (32–256 printable ASCII characters each, without spaces)")
+		}
+		return nil
+	}
+	if remote || cfg.ClientToken != "" || cfg.WorkerToken != "" {
+		if !validAuthToken(cfg.ClientToken) || !validAuthToken(cfg.WorkerToken) || cfg.ClientToken == cfg.WorkerToken {
+			return errors.New("set distinct IDLEMESH_CLIENT_TOKEN and IDLEMESH_WORKER_TOKEN values (32–256 printable ASCII characters each, without spaces)")
+		}
+	}
+	return nil
+}
+
 func validAuthToken(token string) bool {
 	if len(token) < 32 || len(token) > 256 {
 		return false
@@ -165,9 +186,12 @@ func newHandler(s backend, cfg Config) http.Handler {
 	}))
 	mux.HandleFunc("POST /v1/jobs", authorize(cfg.ClientToken, h.submit))
 	mux.HandleFunc("GET /v1/jobs/{id}", authorize(cfg.ClientToken, h.status))
-	mux.HandleFunc("POST /v1/worker/claim", authorize(cfg.WorkerToken, h.claim))
-	mux.HandleFunc("POST /v1/worker/jobs/{id}/renew", authorize(cfg.WorkerToken, h.renew))
-	mux.HandleFunc("POST /v1/worker/jobs/{id}/finish", authorize(cfg.WorkerToken, h.finish))
+	mux.HandleFunc("POST /v1/worker/claim", authorizeWorker(cfg, h.claim))
+	mux.HandleFunc("POST /v1/worker/jobs/{id}/renew", authorizeWorker(cfg, h.renew))
+	mux.HandleFunc("POST /v1/worker/jobs/{id}/finish", authorizeWorker(cfg, h.finish))
+	if cfg.ManagedWorkers {
+		mux.HandleFunc("POST /v1/admin/worker-credentials", authorize(cfg.AdminToken, h.changeWorkerCredential))
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -188,12 +212,68 @@ func authorize(token string, next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		} else if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			problem(w, http.StatusUnauthorized, "a valid bearer token is required")
+			rejectBearer(w)
 			return
 		}
 		next(w, r)
 	}
+}
+
+func rejectBearer(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	problem(w, http.StatusUnauthorized, "a valid bearer token is required")
+}
+
+func authorizeWorker(cfg Config, next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
+	if !cfg.ManagedWorkers {
+		return authorize(cfg.WorkerToken, func(w http.ResponseWriter, r *http.Request) {
+			next(w, r, "")
+		})
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		values := r.Header.Values("Authorization")
+		if len(values) != 1 {
+			rejectBearer(w)
+			return
+		}
+		token, ok := strings.CutPrefix(values[0], "Bearer ")
+		if !ok {
+			rejectBearer(w)
+			return
+		}
+		digest, ok := api.WorkerCredentialDigest(token)
+		if !ok {
+			rejectBearer(w)
+			return
+		}
+		// The backend authenticates this digest together with the requested
+		// operation, so a concurrent revocation cannot be bypassed.
+		next(w, r, digest)
+	}
+}
+
+func (h *handler) changeWorkerCredential(w http.ResponseWriter, r *http.Request) {
+	var req api.WorkerCredentialChange
+	if !decode(w, r, &req) {
+		return
+	}
+	if !api.ValidWorkerID(req.WorkerID) || (req.Digest != "" && !api.ValidWorkerCredentialDigest(req.Digest)) {
+		problem(w, http.StatusBadRequest, "invalid worker ID or credential digest")
+		return
+	}
+	key, valid := idempotencyKey(w, r)
+	if !valid {
+		return
+	}
+	if key == "" {
+		problem(w, http.StatusBadRequest, "Idempotency-Key is required for credential changes")
+		return
+	}
+	if err := h.store.ChangeWorkerCredential(r.Context(), req, key); err != nil {
+		h.storeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handler) submit(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +307,7 @@ func (h *handler) status(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, job)
 }
 
-func (h *handler) claim(w http.ResponseWriter, r *http.Request) {
+func (h *handler) claim(w http.ResponseWriter, r *http.Request, workerDigest string) {
 	var req api.ClaimRequest
 	if !decode(w, r, &req) {
 		return
@@ -240,7 +320,7 @@ func (h *handler) claim(w http.ResponseWriter, r *http.Request) {
 	if !valid {
 		return
 	}
-	lease, err := h.store.Claim(r.Context(), req, key)
+	lease, err := h.store.Claim(r.Context(), req, key, workerDigest)
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -252,7 +332,7 @@ func (h *handler) claim(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, lease)
 }
 
-func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
+func (h *handler) renew(w http.ResponseWriter, r *http.Request, workerDigest string) {
 	var req api.LeaseRequest
 	if !decode(w, r, &req) {
 		return
@@ -261,7 +341,7 @@ func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "invalid lease token")
 		return
 	}
-	lease, err := h.store.Renew(r.Context(), r.PathValue("id"), req.Token)
+	lease, err := h.store.Renew(r.Context(), r.PathValue("id"), req.Token, workerDigest)
 	if err != nil {
 		h.storeError(w, err)
 		return
@@ -269,7 +349,7 @@ func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, lease)
 }
 
-func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
+func (h *handler) finish(w http.ResponseWriter, r *http.Request, workerDigest string) {
 	var req api.FinishRequest
 	if !decode(w, r, &req) {
 		return
@@ -279,7 +359,7 @@ func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "invalid lease token, output, or error")
 		return
 	}
-	if err := h.store.Finish(r.Context(), r.PathValue("id"), req); err != nil {
+	if err := h.store.Finish(r.Context(), r.PathValue("id"), req, workerDigest); err != nil {
 		h.storeError(w, err)
 		return
 	}
@@ -336,6 +416,12 @@ func (h *handler) storeError(w http.ResponseWriter, err error) {
 		problem(w, http.StatusServiceUnavailable, errQueueFull.Error())
 	case errors.Is(err, errKeyConflict):
 		problem(w, http.StatusConflict, errKeyConflict.Error())
+	case errors.Is(err, errWorkerUnauthorized):
+		rejectBearer(w)
+	case errors.Is(err, errWorkerDigestConflict):
+		problem(w, http.StatusConflict, errWorkerDigestConflict.Error())
+	case errors.Is(err, errInvalidWorkerCredential):
+		problem(w, http.StatusBadRequest, errInvalidWorkerCredential.Error())
 	case errors.Is(err, ha.ErrUnavailable):
 		problem(w, http.StatusServiceUnavailable, "no ready coordinator leader at this endpoint")
 	default:
